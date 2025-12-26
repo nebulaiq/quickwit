@@ -13,6 +13,10 @@ fmt:
 	@echo "Checking log format"
 	@bash scripts/check_log_format.sh
 
+dependency-licenses.html: Cargo.lock scripts/about.hbs scripts/about.toml
+	@echo "Checking dependency licenses"
+	@cargo about generate -c scripts/about.toml scripts/about.hbs -o dependency-licenses.html --workspace
+
 fix:
 	@echo "Running cargo clippy --fix"
 	@cargo clippy --workspace --all-features --tests --fix --allow-dirty --allow-staged
@@ -30,7 +34,7 @@ test-all:
 	QW_S3_FORCE_PATH_STYLE_ACCESS=1 \
 	QW_TEST_DATABASE_URL=postgres://quickwit-dev:quickwit-dev@localhost:5432/quickwit-metastore-dev \
 	RUST_MIN_STACK=67108864 \
-	cargo nextest run --all-features --retries 1
+	cargo nextest run --all-features --retries 5
 	cargo nextest run --test failpoints --features fail/failpoints
 
 test-failpoints:
@@ -64,3 +68,6 @@ build-ui:
 
 rm-postgres:
 	rm -fr /tmp/quickwit/services/postgres
+
+update-licenses:
+	 dd-rust-license-tool --config license-tool.toml write

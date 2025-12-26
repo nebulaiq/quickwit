@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::BTreeSet;
 
@@ -31,6 +26,7 @@ use quickwit_proto::tonic::transport::Channel;
 use quickwit_proto::types::IndexUid;
 
 pub(crate) mod delete_task;
+pub(crate) mod get_identity;
 pub(crate) mod index;
 pub(crate) mod list_splits;
 pub(crate) mod shard;
@@ -89,14 +85,14 @@ async fn create_channel(client: tokio::io::DuplexStream) -> anyhow::Result<Chann
     use http::Uri;
     use quickwit_proto::tonic::transport::Endpoint;
 
-    let mut client = Some(client);
+    let mut outer_client_opt = Some(client);
     let channel = Endpoint::try_from("http://test.server")?
         .connect_with_connector(tower::service_fn(move |_: Uri| {
-            let client = client.take();
+            let inner_client_opt = outer_client_opt.take();
             async move {
-                client.ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::Other, "client already taken")
-                })
+                let client = inner_client_opt
+                    .ok_or_else(|| std::io::Error::other("client already taken"))?;
+                std::io::Result::Ok(hyper_util::rt::TokioIo::new(client))
             }
         }))
         .await?;
@@ -166,6 +162,7 @@ async fn cleanup_index(metastore: &mut dyn MetastoreServiceExt, index_uid: Index
         .unwrap();
 }
 
+/// macro used to generate a testsuite for an implementation of Metastore
 #[macro_export]
 macro_rules! metastore_test_suite {
     ($metastore_type:ty) => {
@@ -183,48 +180,56 @@ macro_rules! metastore_test_suite {
             //  - delete_index
 
             #[tokio::test]
+            #[serial_test::file_serial]
             async fn test_metastore_create_index() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::index::test_metastore_create_index::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_create_index_with_sources() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::index::test_metastore_create_index_with_sources::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_update_retention_policy() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::index::test_metastore_update_retention_policy::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_update_search_settings() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::index::test_metastore_update_search_settings::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_update_doc_mapping() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::index::test_metastore_update_doc_mapping::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_update_indexing_settings() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::index::test_metastore_update_indexing_settings::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
+            async fn test_metastore_update_ingest_settings() {
+                let _ = tracing_subscriber::fmt::try_init();
+                $crate::tests::index::test_metastore_update_ingest_settings::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
             async fn test_metastore_create_index_enforces_index_id_maximum_length() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::index::test_metastore_create_index_enforces_index_id_maximum_length::<
@@ -234,42 +239,42 @@ macro_rules! metastore_test_suite {
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_index_exists() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::index::test_metastore_index_exists::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_index_metadata() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::index::test_metastore_index_metadata::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_indexes_metadata() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::index::test_metastore_indexes_metadata::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_list_indexes() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::index::test_metastore_list_indexes::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_list_all_indexes() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::index::test_metastore_list_all_indexes::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_delete_index() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::index::test_metastore_delete_index::<$metastore_type>().await;
@@ -284,14 +289,14 @@ macro_rules! metastore_test_suite {
             //  - delete_splits
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_publish_splits() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::split::test_metastore_publish_splits::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_publish_splits_concurrency() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::split::test_metastore_publish_splits_concurrency::<$metastore_type>(
@@ -300,7 +305,7 @@ macro_rules! metastore_test_suite {
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_publish_splits_empty_splits_array_is_allowed() {
                 $crate::tests::split::test_metastore_publish_splits_empty_splits_array_is_allowed::<
                             $metastore_type,
@@ -309,14 +314,14 @@ macro_rules! metastore_test_suite {
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_replace_splits() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::split::test_metastore_replace_splits::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_mark_splits_for_deletion() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::split::test_metastore_mark_splits_for_deletion::<$metastore_type>()
@@ -324,28 +329,28 @@ macro_rules! metastore_test_suite {
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_delete_splits() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::split::test_metastore_delete_splits::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_stream_splits() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::list_splits::test_metastore_stream_splits::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_list_all_splits() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::list_splits::test_metastore_list_all_splits::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_list_splits() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::list_splits::test_metastore_list_splits::<$metastore_type>().await;
@@ -353,14 +358,14 @@ macro_rules! metastore_test_suite {
 
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_list_splits_by_node() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::list_splits::test_metastore_list_splits_by_node_id::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_split_update_timestamp() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::split::test_metastore_split_update_timestamp::<$metastore_type>()
@@ -368,70 +373,98 @@ macro_rules! metastore_test_suite {
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_add_source() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::source::test_metastore_add_source::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
+            async fn test_metastore_update_source() {
+                let _ = tracing_subscriber::fmt::try_init();
+                $crate::tests::source::test_metastore_update_source::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
             async fn test_metastore_toggle_source() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::source::test_metastore_toggle_source::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_delete_source() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::source::test_metastore_delete_source::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_reset_checkpoint() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::source::test_metastore_reset_checkpoint::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_create_delete_task() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::delete_task::test_metastore_create_delete_task::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_last_delete_opstamp() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::delete_task::test_metastore_last_delete_opstamp::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_delete_index_with_tasks() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::delete_task::test_metastore_delete_index_with_tasks::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_list_delete_tasks() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::delete_task::test_metastore_list_delete_tasks::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_list_stale_splits() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::list_splits::test_metastore_list_stale_splits::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
+            async fn test_metastore_list_sorted_splits() {
+                let _ = tracing_subscriber::fmt::try_init();
+                $crate::tests::list_splits::test_metastore_list_sorted_splits::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
+            async fn test_metastore_list_after_split() {
+                let _ = tracing_subscriber::fmt::try_init();
+                $crate::tests::list_splits::test_metastore_list_after_split::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
+            async fn test_metastore_list_splits_from_all_indexes() {
+                let _ = tracing_subscriber::fmt::try_init();
+                $crate::tests::list_splits::test_metastore_list_splits_from_all_indexes::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
             async fn test_metastore_update_splits_delete_opstamp() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::split::test_metastore_update_splits_delete_opstamp::<$metastore_type>()
@@ -439,7 +472,7 @@ macro_rules! metastore_test_suite {
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_stage_splits() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::split::test_metastore_stage_splits::<$metastore_type>().await;
@@ -448,27 +481,33 @@ macro_rules! metastore_test_suite {
             /// Shard API tests
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_open_shards() {
                 $crate::tests::shard::test_metastore_open_shards::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_acquire_shards() {
                 $crate::tests::shard::test_metastore_acquire_shards::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_list_shards() {
                 $crate::tests::shard::test_metastore_list_shards::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_delete_shards() {
                 $crate::tests::shard::test_metastore_delete_shards::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
+            async fn test_metastore_prune_shards() {
+                $crate::tests::shard::test_metastore_prune_shards::<$metastore_type>().await;
             }
 
             #[tokio::test]
@@ -478,7 +517,7 @@ macro_rules! metastore_test_suite {
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_apply_checkpoint_delta_v2_multi_shards() {
                 $crate::tests::shard::test_metastore_apply_checkpoint_delta_v2_multi_shards::<$metastore_type>().await;
             }
@@ -486,33 +525,40 @@ macro_rules! metastore_test_suite {
             /// Index Template API tests
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_create_index_template() {
                 $crate::tests::template::test_metastore_create_index_template::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_get_index_template() {
                 $crate::tests::template::test_metastore_get_index_template::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_find_index_template_matches() {
                 $crate::tests::template::test_metastore_find_index_template_matches::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_list_index_templates() {
                 $crate::tests::template::test_metastore_list_index_templates::<$metastore_type>().await;
             }
 
             #[tokio::test]
-            #[serial_test::serial]
+            #[serial_test::file_serial]
             async fn test_metastore_delete_index_templates() {
                 $crate::tests::template::test_metastore_delete_index_templates::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
+            async fn test_metastore_get_identity() {
+                let _ = tracing_subscriber::fmt::try_init();
+                $crate::tests::get_identity::test_metastore_get_identity::<$metastore_type>().await;
             }
         }
     };

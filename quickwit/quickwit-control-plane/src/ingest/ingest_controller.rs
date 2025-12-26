@@ -1,35 +1,32 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
 use fnv::FnvHashSet;
-use futures::stream::FuturesUnordered;
 use futures::StreamExt;
+use futures::stream::FuturesUnordered;
+use itertools::{Itertools, MinMaxResult};
 use quickwit_actors::Mailbox;
-use quickwit_common::pretty::PrettySample;
 use quickwit_common::Progress;
+use quickwit_common::pretty::PrettySample;
 use quickwit_ingest::{IngesterPool, LeaderId, LocalShardsUpdate};
 use quickwit_proto::control_plane::{
     AdviseResetShardsRequest, AdviseResetShardsResponse, GetOrCreateOpenShardsFailureReason,
@@ -45,17 +42,17 @@ use quickwit_proto::ingest::{
     Shard, ShardIdPosition, ShardIdPositions, ShardIds, ShardPKey, ShardState,
 };
 use quickwit_proto::metastore::{
-    serde_utils, MetastoreResult, MetastoreService, MetastoreServiceClient, OpenShardSubrequest,
-    OpenShardsRequest, OpenShardsResponse,
+    MetastoreResult, MetastoreService, MetastoreServiceClient, OpenShardSubrequest,
+    OpenShardsRequest, OpenShardsResponse, serde_utils,
 };
 use quickwit_proto::types::{IndexUid, NodeId, NodeIdRef, Position, ShardId, SourceUid};
 use rand::rngs::ThreadRng;
 use rand::seq::SliceRandom;
-use rand::{thread_rng, Rng, RngCore};
+use rand::{Rng, RngCore, thread_rng};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::task::JoinHandle;
-use tracing::{debug, enabled, error, info, warn, Level};
+use tracing::{Level, debug, enabled, error, info, warn};
 use ulid::Ulid;
 
 use super::scaling_arbiter::ScalingArbiter;
@@ -85,11 +82,11 @@ const FIRE_AND_FORGET_TIMEOUT: Duration = Duration::from_secs(3);
 /// All errors are ignored, and not even logged.
 fn fire_and_forget(
     fut: impl Future<Output = ()> + Send + 'static,
-    operation: impl std::fmt::Display + Send + Sync + 'static,
+    operation: impl std::fmt::Display + Send + 'static,
 ) {
     tokio::spawn(async move {
         if let Err(_timeout_elapsed) = tokio::time::timeout(FIRE_AND_FORGET_TIMEOUT, fut).await {
-            error!(operation=%operation, "timeout elapsed");
+            error!(%operation, "timeout elapsed");
         }
     });
 }
@@ -290,6 +287,7 @@ impl IngestController {
         ingester_pool: IngesterPool,
         replication_factor: usize,
         max_shard_ingestion_throughput_mib_per_sec: f32,
+        shard_scale_up_factor: f32,
     ) -> Self {
         IngestController {
             metastore,
@@ -299,6 +297,7 @@ impl IngestController {
             stats: IngestControllerStats::default(),
             scaling_arbiter: ScalingArbiter::with_max_shard_ingestion_throughput_mib_per_sec(
                 max_shard_ingestion_throughput_mib_per_sec,
+                shard_scale_up_factor,
             ),
         }
     }
@@ -396,17 +395,24 @@ impl IngestController {
             &local_shards_update.source_uid,
             &local_shards_update.shard_infos,
         );
-        let Some(scaling_mode) = self.scaling_arbiter.should_scale(shard_stats) else {
+        let min_shards = model
+            .index_metadata(&local_shards_update.source_uid.index_uid)
+            .expect("index should exist")
+            .index_config
+            .ingest_settings
+            .min_shards;
+
+        let Some(scaling_mode) = self.scaling_arbiter.should_scale(shard_stats, min_shards) else {
             return Ok(());
         };
-
         match scaling_mode {
-            ScalingMode::Up => {
+            ScalingMode::Up(num_shards) => {
                 self.try_scale_up_shards(
                     local_shards_update.source_uid,
                     shard_stats,
                     model,
                     progress,
+                    num_shards,
                 )
                 .await?;
             }
@@ -414,6 +420,7 @@ impl IngestController {
                 self.try_scale_down_shards(
                     local_shards_update.source_uid,
                     shard_stats,
+                    min_shards,
                     model,
                     progress,
                 )
@@ -445,7 +452,7 @@ impl IngestController {
         let mut get_or_create_open_shards_successes = Vec::with_capacity(num_subrequests);
         let mut get_or_create_open_shards_failures = Vec::new();
 
-        let mut num_missing_shards_per_source_uids = HashMap::new();
+        let mut per_source_num_shards_to_open = HashMap::new();
 
         let unavailable_leaders: FnvHashSet<NodeId> = get_open_shards_request
             .unavailable_leaders
@@ -466,19 +473,24 @@ impl IngestController {
                     .index_uid(&get_open_shards_subrequest.index_id)
                     .expect("index should exist")
                     .clone();
+                let min_shards = model
+                    .index_metadata(&index_uid)
+                    .expect("index should exist")
+                    .index_config
+                    .ingest_settings
+                    .min_shards
+                    .get();
                 let source_uid = SourceUid {
                     index_uid,
                     source_id: get_open_shards_subrequest.source_id.clone(),
                 };
-                *num_missing_shards_per_source_uids
-                    .entry(source_uid)
-                    .or_default() += 1;
+                per_source_num_shards_to_open.insert(source_uid, min_shards);
             }
         }
 
         if let Err(metastore_error) = self
             .try_open_shards(
-                num_missing_shards_per_source_uids,
+                per_source_num_shards_to_open,
                 model,
                 &unavailable_leaders,
                 progress,
@@ -675,20 +687,19 @@ impl IngestController {
         shard_stats: ShardStats,
         model: &mut ControlPlaneModel,
         progress: &Progress,
+        num_shards_to_open: usize,
     ) -> MetastoreResult<()> {
-        const NUM_PERMITS: u64 = 1;
-
         if !model
-            .acquire_scaling_permits(&source_uid, ScalingMode::Up, NUM_PERMITS)
+            .acquire_scaling_permits(&source_uid, ScalingMode::Up(num_shards_to_open))
             .unwrap_or(false)
         {
             return Ok(());
         }
-        let new_num_open_shards = shard_stats.num_open_shards + 1;
-        let new_shard_source_uids: HashMap<SourceUid, usize> =
-            HashMap::from_iter([(source_uid.clone(), 1)]);
+        let new_num_open_shards = shard_stats.num_open_shards + num_shards_to_open;
+        let new_shards_per_source: HashMap<SourceUid, usize> =
+            HashMap::from_iter([(source_uid.clone(), num_shards_to_open)]);
         let successful_source_uids_res = self
-            .try_open_shards(new_shard_source_uids, model, &Default::default(), progress)
+            .try_open_shards(new_shards_per_source, model, &Default::default(), progress)
             .await;
 
         match successful_source_uids_res {
@@ -698,7 +709,7 @@ impl IngestController {
                 if successful_source_uids.is_empty() {
                     // We did not manage to create the shard.
                     // We can release our permit.
-                    model.release_scaling_permits(&source_uid, ScalingMode::Up, NUM_PERMITS);
+                    model.release_scaling_permits(&source_uid, ScalingMode::Up(num_shards_to_open));
                     warn!(
                         index_uid=%source_uid.index_uid,
                         source_id=%source_uid.source_id,
@@ -722,7 +733,7 @@ impl IngestController {
                     source_id=%source_uid.source_id,
                     "scaling up number of shards to {new_num_open_shards} failed: {metastore_error:?}"
                 );
-                model.release_scaling_permits(&source_uid, ScalingMode::Up, NUM_PERMITS);
+                model.release_scaling_permits(&source_uid, ScalingMode::Up(num_shards_to_open));
                 Err(metastore_error)
             }
         }
@@ -746,26 +757,26 @@ impl IngestController {
     /// The number of successfully open shards is returned.
     async fn try_open_shards(
         &mut self,
-        source_uids: HashMap<SourceUid, usize>,
+        per_source_num_shards_to_open: HashMap<SourceUid, usize>,
         model: &mut ControlPlaneModel,
         unavailable_leaders: &FnvHashSet<NodeId>,
         progress: &Progress,
     ) -> MetastoreResult<HashMap<SourceUid, usize>> {
-        let num_shards: usize = source_uids.values().sum();
+        let total_num_shards_to_open: usize = per_source_num_shards_to_open.values().sum();
 
-        if num_shards == 0 {
+        if total_num_shards_to_open == 0 {
             return Ok(HashMap::new());
         }
         // TODO unavailable leaders
         let Some(leader_follower_pairs) =
-            self.allocate_shards(num_shards, unavailable_leaders, model)
+            self.allocate_shards(total_num_shards_to_open, unavailable_leaders, model)
         else {
             return Ok(HashMap::new());
         };
 
-        let source_uids_with_multiplicity = source_uids
+        let source_uids_with_multiplicity = per_source_num_shards_to_open
             .iter()
-            .flat_map(|(source_uid, count)| std::iter::repeat(source_uid).take(*count));
+            .flat_map(|(source_uid, count)| std::iter::repeat_n(source_uid, *count));
 
         let mut init_shard_subrequests: Vec<InitShardSubrequest> = Vec::new();
 
@@ -779,6 +790,13 @@ impl IngestController {
             let index_metadata = model
                 .index_metadata(&source_uid.index_uid)
                 .expect("index should exist");
+            let has_transform = model
+                .source_metadata(source_uid)
+                .expect("source should exist")
+                .transform_config
+                .is_some();
+            let validate_docs =
+                index_metadata.index_config.ingest_settings.validate_docs && !has_transform;
             let doc_mapping = &index_metadata.index_config.doc_mapping;
             let doc_mapping_uid = doc_mapping.doc_mapping_uid;
             let doc_mapping_json = serde_utils::to_json_str(doc_mapping)?;
@@ -793,11 +811,13 @@ impl IngestController {
                 doc_mapping_uid: Some(doc_mapping_uid),
                 publish_position_inclusive: Some(Position::Beginning),
                 publish_token: None,
+                update_timestamp: 0, // assigned later by the metastore
             };
             let init_shard_subrequest = InitShardSubrequest {
                 subrequest_id: subrequest_id as u32,
                 shard: Some(shard),
                 doc_mapping_json,
+                validate_docs,
             };
             init_shard_subrequests.push(init_shard_subrequest);
         }
@@ -850,13 +870,17 @@ impl IngestController {
         &self,
         source_uid: SourceUid,
         shard_stats: ShardStats,
+        min_shards: NonZeroUsize,
         model: &mut ControlPlaneModel,
         progress: &Progress,
     ) -> MetastoreResult<()> {
-        const NUM_PERMITS: u64 = 1;
-
+        // The scaling arbiter should not suggest scaling down if the number of shards is already
+        // below the minimum, but we're just being defensive here.
+        if shard_stats.num_open_shards <= min_shards.get() {
+            return Ok(());
+        }
         if !model
-            .acquire_scaling_permits(&source_uid, ScalingMode::Down, NUM_PERMITS)
+            .acquire_scaling_permits(&source_uid, ScalingMode::Down)
             .unwrap_or(false)
         {
             return Ok(());
@@ -869,12 +893,12 @@ impl IngestController {
             "scaling down number of shards to {new_num_open_shards}"
         );
         let Some((leader_id, shard_id)) = find_scale_down_candidate(&source_uid, model) else {
-            model.release_scaling_permits(&source_uid, ScalingMode::Down, NUM_PERMITS);
+            model.release_scaling_permits(&source_uid, ScalingMode::Down);
             return Ok(());
         };
         info!("scaling down shard {shard_id} from {leader_id}");
         let Some(ingester) = self.ingester_pool.get(&leader_id) else {
-            model.release_scaling_permits(&source_uid, ScalingMode::Down, NUM_PERMITS);
+            model.release_scaling_permits(&source_uid, ScalingMode::Down);
             return Ok(());
         };
         let shard_pkeys = vec![ShardPKey {
@@ -889,7 +913,7 @@ impl IngestController {
             .await
         {
             warn!("failed to scale down number of shards: {error}");
-            model.release_scaling_permits(&source_uid, ScalingMode::Down, NUM_PERMITS);
+            model.release_scaling_permits(&source_uid, ScalingMode::Down);
             return Ok(());
         }
         model.close_shards(&source_uid, &[shard_id]);
@@ -901,7 +925,10 @@ impl IngestController {
         request: AdviseResetShardsRequest,
         model: &ControlPlaneModel,
     ) -> AdviseResetShardsResponse {
-        info!("advise reset shards");
+        info!(
+            "received advise reset shards request from `{}`",
+            request.ingester_id
+        );
         debug!(shard_ids=?summarize_shard_ids(&request.shard_ids), "advise reset shards");
 
         let mut shards_to_delete: Vec<ShardIds> = Vec::new();
@@ -974,67 +1001,9 @@ impl IngestController {
         }
     }
 
-    /// This method just "computes"" the number of shards to move for rebalance.
-    /// It does not run any side effect except logging.
-    ///
-    /// TODO we consider the number of alive ingesters for this computation,
-    /// but deal with entire number of shards here.
-    /// This could cause problems when dealing with a lot of unavailable ingesters.
-    ///
-    /// On the other hand it biases thing the "right way":
-    /// If we are missing some ingesters, their shards should still be in the model, but they should
-    /// be missing from the ingester pool.
-    ///
-    /// As a result `num_open_shards_per_leader_threshold` should be inflated.
-    ///
-    /// TODO this implementation does not consider replica.
-    fn rebalance_compute_shards_to_move(&self, model: &ControlPlaneModel) -> Vec<Shard> {
-        let num_ingesters = self.ingester_pool.len();
-        let mut num_open_shards: usize = 0;
-
-        if num_ingesters == 0 {
-            debug!("no ingester available");
-            return Vec::new();
-        }
-
-        let mut per_leader_open_shards: HashMap<&str, Vec<&ShardEntry>> = HashMap::new();
-
-        for shard in model.all_shards() {
-            if shard.is_open() {
-                num_open_shards += 1;
-                per_leader_open_shards
-                    .entry(&shard.leader_id)
-                    .or_default()
-                    .push(shard);
-            }
-        }
-
-        // We tolerate an ingester with 10% more shards than the average.
-        // Let's first identify the list of shards we want to "move".
-        let num_open_shards_per_leader_threshold =
-            (num_open_shards * 11).div_ceil(10 * num_ingesters);
-        let mut shards_to_move: Vec<Shard> = Vec::new();
-
-        let mut rng = thread_rng();
-        for open_shards in per_leader_open_shards.values() {
-            if let Some(num_shards_to_move) = open_shards
-                .len()
-                .checked_sub(num_open_shards_per_leader_threshold)
-            {
-                shards_to_move.extend(
-                    open_shards[..]
-                        .choose_multiple(&mut rng, num_shards_to_move)
-                        .map(|shard_entry| shard_entry.shard.clone()),
-                );
-            }
-        }
-
-        shards_to_move
-    }
-
-    /// Moves shards from ingesters with too many shards to ingesters with too few shards. Moving a
-    /// shard consists of closing the shard on the source ingester and opening a new one on the
-    /// target ingester.
+    /// Rebalances shards from ingesters with too many shards to ingesters with too few shards.
+    /// Moving a shard consists of closing the shard on the source ingester and opening a new
+    /// one on the target ingester.
     ///
     /// This method is guarded by a lock to ensure that only one rebalance operation is performed at
     /// a time.
@@ -1045,54 +1014,68 @@ impl IngestController {
         progress: &Progress,
     ) -> MetastoreResult<Option<JoinHandle<()>>> {
         let Ok(rebalance_guard) = self.rebalance_lock.clone().try_lock_owned() else {
+            debug!("skipping rebalance: another rebalance is already in progress");
             return Ok(None);
         };
         self.stats.num_rebalance_shards_ops += 1;
 
-        let shards_to_move: Vec<Shard> = self.rebalance_compute_shards_to_move(model);
-        if shards_to_move.is_empty() {
+        let shards_to_rebalance: Vec<Shard> = self.compute_shards_to_rebalance(model);
+
+        crate::metrics::CONTROL_PLANE_METRICS
+            .rebalance_shards
+            .set(shards_to_rebalance.len() as i64);
+
+        if shards_to_rebalance.is_empty() {
             return Ok(None);
         }
+        let mut per_source_num_shards_to_open: HashMap<SourceUid, usize> = HashMap::new();
 
-        let num_shards_to_move = shards_to_move.len();
-        info!("rebalancing {} shards", num_shards_to_move);
-
-        let mut new_shards_source_uids: HashMap<SourceUid, usize> = HashMap::new();
-        for shard in &shards_to_move {
-            *new_shards_source_uids
+        for shard in &shards_to_rebalance {
+            *per_source_num_shards_to_open
                 .entry(shard.source_uid())
                 .or_default() += 1;
         }
 
-        let mut successfully_source_uids: HashMap<SourceUid, usize> = self
-            .try_open_shards(new_shards_source_uids, model, &Default::default(), progress)
-            .await?;
+        let mut per_source_num_opened_shards: HashMap<SourceUid, usize> = self
+            .try_open_shards(
+                per_source_num_shards_to_open,
+                model,
+                &Default::default(),
+                progress,
+            )
+            .await
+            .inspect_err(|error| {
+                error!(%error, "failed to open shards during rebalance");
+                crate::metrics::CONTROL_PLANE_METRICS
+                    .rebalance_shards
+                    .set(0);
+            })?;
 
-        for source_uid in successfully_source_uids.keys() {
+        let num_opened_shards: usize = per_source_num_opened_shards.values().sum();
+
+        crate::metrics::CONTROL_PLANE_METRICS
+            .rebalance_shards
+            .set(num_opened_shards as i64);
+
+        for source_uid in per_source_num_opened_shards.keys() {
             // We temporarily disable the ability the scale down the number of shards for
             // the source to avoid closing the shards we just opened.
             model.drain_scaling_permits(source_uid, ScalingMode::Down);
         }
 
-        // Let's close one of the shard to move for every successfully newly opened shards.
-        let mut shards_to_close = Vec::new();
-        for shard in shards_to_move {
+        // Close as many shards as we opened. Because `try_open_shards` might fail partially, we
+        // must only close the shards that we successfully opened.
+        let mut shards_to_close = Vec::with_capacity(shards_to_rebalance.len());
+        for shard in shards_to_rebalance {
             let source_uid = shard.source_uid();
-            let Some(num_open_shards) = successfully_source_uids.get_mut(&source_uid) else {
+            let Some(num_open_shards) = per_source_num_opened_shards.get_mut(&source_uid) else {
                 continue;
             };
             if *num_open_shards == 0 {
                 continue;
             };
             *num_open_shards -= 1;
-
-            let leader_id = NodeId::from(shard.leader_id.clone());
-            let shard_pkey = ShardPKey {
-                index_uid: shard.index_uid.clone(),
-                source_id: shard.source_id.clone(),
-                shard_id: shard.shard_id.clone(),
-            };
-            shards_to_close.push((leader_id, shard_pkey));
+            shards_to_close.push(shard);
         }
 
         let mailbox_clone = mailbox.clone();
@@ -1119,13 +1102,112 @@ impl IngestController {
         Ok(Some(tokio::spawn(close_shards_and_send_callback_fut)))
     }
 
+    /// This method just "computes"" the number of shards to move for rebalance.
+    /// It does not run any side effect except logging.
+    ///
+    /// TODO: We consider the number of available (i.e. alive according to chitchat) ingesters for
+    /// this computation, but deal with the entire number of shards here.
+    /// This could cause problems when dealing with a lot of unavailable ingesters.
+    ///
+    /// On the other hand it biases thing the "right way":
+    /// If we are missing some ingesters, their shards should still be in the model, but they should
+    /// be missing from the ingester pool.
+    ///
+    /// As a result `target_num_open_shards_per_leader` should be inflated.
+    ///
+    /// TODO: This implementation does not consider replicas.
+    fn compute_shards_to_rebalance(&self, model: &ControlPlaneModel) -> Vec<Shard> {
+        let ingester_ids: Vec<NodeId> = self.ingester_pool.keys();
+        let num_ingesters = ingester_ids.len();
+
+        if num_ingesters == 0 {
+            debug!("no ingesters available");
+            return Vec::new();
+        }
+        if num_ingesters < 2 {
+            return Vec::new();
+        }
+        let mut num_open_shards: usize = 0;
+        let mut per_leader_open_shards: HashMap<&str, Vec<&Shard>> = HashMap::new();
+
+        for shard in model.all_shards() {
+            if shard.is_open() {
+                num_open_shards += 1;
+                per_leader_open_shards
+                    .entry(&shard.leader_id)
+                    .or_default()
+                    .push(&shard.shard);
+            }
+        }
+        for ingester_id in &ingester_ids {
+            per_leader_open_shards
+                .entry(ingester_id.as_str())
+                .or_default();
+        }
+        let target_num_open_shards_per_leader = num_open_shards as f32 / num_ingesters as f32;
+        let max_num_open_shards_per_leader =
+            f32::ceil(target_num_open_shards_per_leader * 1.1) as usize;
+        let min_num_open_shards_per_leader =
+            f32::floor(target_num_open_shards_per_leader * 0.9) as usize;
+
+        let mut rng = thread_rng();
+        let mut per_leader_open_shard_shuffled: Vec<Vec<&Shard>> = per_leader_open_shards
+            .into_values()
+            .map(|mut shards| {
+                shards.shuffle(&mut rng);
+                shards
+            })
+            .collect();
+
+        let mut shards_to_rebalance: Vec<Shard> = Vec::new();
+
+        loop {
+            let MinMaxResult::MinMax(min_shards, max_shards) = per_leader_open_shard_shuffled
+                .iter_mut()
+                .minmax_by_key(|shards| shards.len())
+            else {
+                break;
+            };
+            if min_shards.len() < min_num_open_shards_per_leader
+                || max_shards.len() > max_num_open_shards_per_leader
+            {
+                let shard = max_shards.pop().expect("shards should not be empty");
+                shards_to_rebalance.push(shard.clone());
+                min_shards.push(shard);
+            } else {
+                break;
+            }
+        }
+        let num_shards_to_rebalance = shards_to_rebalance.len();
+
+        if num_shards_to_rebalance == 0 {
+            debug!("no shards to rebalance");
+        } else {
+            info!(
+                num_open_shards,
+                num_available_ingesters = num_ingesters,
+                min_shards_threshold = min_num_open_shards_per_leader,
+                max_shards_threshold = max_num_open_shards_per_leader,
+                num_shards_to_rebalance,
+                "rebalancing {num_shards_to_rebalance} shards"
+            );
+        }
+        shards_to_rebalance
+    }
+
     fn close_shards(
         &self,
-        shards_to_close: Vec<(LeaderId, ShardPKey)>,
+        shards_to_close: Vec<Shard>,
     ) -> impl Future<Output = Vec<ShardPKey>> + Send + 'static {
         let mut per_leader_shards_to_close: HashMap<LeaderId, Vec<ShardPKey>> = HashMap::new();
 
-        for (leader_id, shard_pkey) in shards_to_close {
+        for shard in shards_to_close {
+            let shard_pkey = ShardPKey {
+                index_uid: shard.index_uid,
+                source_id: shard.source_id,
+                shard_id: shard.shard_id,
+            };
+            let leader_id = NodeId::from(shard.leader_id);
             per_leader_shards_to_close
                 .entry(leader_id)
                 .or_default()
@@ -1228,15 +1310,15 @@ mod tests {
 
     use std::collections::BTreeSet;
     use std::str::FromStr;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use itertools::Itertools;
     use quickwit_actors::Universe;
     use quickwit_common::setup_logging_for_tests;
     use quickwit_common::shared_consts::DEFAULT_SHARD_THROUGHPUT_LIMIT;
     use quickwit_common::tower::DelayLayer;
-    use quickwit_config::{DocMapping, SourceConfig, INGEST_V2_SOURCE_ID};
+    use quickwit_config::{DocMapping, INGEST_V2_SOURCE_ID, SourceConfig};
     use quickwit_ingest::{RateMibPerSec, ShardInfo};
     use quickwit_metastore::IndexMetadata;
     use quickwit_proto::control_plane::GetOrCreateOpenShardsSubrequest;
@@ -1323,7 +1405,7 @@ mod tests {
 
                 let shard = subrequest.shard();
                 assert_eq!(shard.index_uid(), &index_uid_1_clone);
-                assert_eq!(shard.source_id, "test-source");
+                assert_eq!(shard.source_id, source_id);
                 assert_eq!(shard.leader_id, "test-ingester-2");
 
                 let successes = vec![InitShardSuccess {
@@ -1345,6 +1427,7 @@ mod tests {
             ingester_pool.clone(),
             replication_factor,
             TEST_SHARD_THROUGHPUT_LIMIT_MIB,
+            1.001,
         );
 
         let mut model = ControlPlaneModel::default();
@@ -1506,7 +1589,7 @@ mod tests {
 
                 let shard = subrequest.shard();
                 assert_eq!(shard.index_uid(), &index_uid_0);
-                assert_eq!(shard.source_id, "test-source");
+                assert_eq!(shard.source_id, source_id);
                 assert_eq!(shard.leader_id, "test-ingester-1");
 
                 let successes = vec![InitShardSuccess {
@@ -1530,6 +1613,7 @@ mod tests {
             ingester_pool,
             replication_factor,
             TEST_SHARD_THROUGHPUT_LIMIT_MIB,
+            1.001,
         );
 
         let mut model = ControlPlaneModel::default();
@@ -1572,6 +1656,7 @@ mod tests {
             ingester_pool,
             replication_factor,
             TEST_SHARD_THROUGHPUT_LIMIT_MIB,
+            1.001,
         );
         let mut model = ControlPlaneModel::default();
 
@@ -1622,6 +1707,7 @@ mod tests {
             ingester_pool.clone(),
             replication_factor,
             TEST_SHARD_THROUGHPUT_LIMIT_MIB,
+            1.001,
         );
 
         let mut model = ControlPlaneModel::default();
@@ -1804,6 +1890,7 @@ mod tests {
             ingester_pool.clone(),
             replication_factor,
             TEST_SHARD_THROUGHPUT_LIMIT_MIB,
+            1.001,
         );
 
         let ingester_id_0 = NodeId::from("test-ingester-0");
@@ -1910,6 +1997,7 @@ mod tests {
                     ..Default::default()
                 }),
                 doc_mapping_json: "{}".to_string(),
+                validate_docs: false,
             },
             InitShardSubrequest {
                 subrequest_id: 1,
@@ -1922,6 +2010,7 @@ mod tests {
                     ..Default::default()
                 }),
                 doc_mapping_json: "{}".to_string(),
+                validate_docs: false,
             },
             InitShardSubrequest {
                 subrequest_id: 2,
@@ -1934,6 +2023,7 @@ mod tests {
                     ..Default::default()
                 }),
                 doc_mapping_json: "{}".to_string(),
+                validate_docs: false,
             },
             InitShardSubrequest {
                 subrequest_id: 3,
@@ -1946,6 +2036,7 @@ mod tests {
                     ..Default::default()
                 }),
                 doc_mapping_json: "{}".to_string(),
+                validate_docs: false,
             },
             InitShardSubrequest {
                 subrequest_id: 4,
@@ -1958,6 +2049,7 @@ mod tests {
                     ..Default::default()
                 }),
                 doc_mapping_json: "{}".to_string(),
+                validate_docs: false,
             },
         ];
         let init_shards_response = controller
@@ -2022,6 +2114,7 @@ mod tests {
             ingester_pool.clone(),
             replication_factor,
             TEST_SHARD_THROUGHPUT_LIMIT_MIB,
+            1.001,
         );
 
         let index_uid = IndexUid::for_test("test-index", 0);
@@ -2032,6 +2125,10 @@ mod tests {
             source_id: source_id.clone(),
         };
         let mut index_metadata = IndexMetadata::for_test("test-index", "ram://indexes/test-index");
+        index_metadata.sources.insert(
+            source_id.clone(),
+            SourceConfig::for_test(&source_id, quickwit_config::SourceParams::void()),
+        );
 
         let doc_mapping_json = format!(
             r#"{{
@@ -2136,6 +2233,7 @@ mod tests {
                     doc_mapping_uid: subrequest.doc_mapping_uid,
                     publish_position_inclusive: Some(Position::Beginning),
                     publish_token: None,
+                    update_timestamp: 1724158996,
                 };
                 let response = OpenShardsResponse {
                     subresponses: vec![OpenShardSubresponse {
@@ -2154,11 +2252,16 @@ mod tests {
             ingester_pool.clone(),
             replication_factor,
             TEST_SHARD_THROUGHPUT_LIMIT_MIB,
+            1.001,
         );
 
         let index_uid = IndexUid::for_test("test-index", 0);
-        let index_metadata = IndexMetadata::for_test("test-index", "ram://indexes/test-index");
+        let mut index_metadata = IndexMetadata::for_test("test-index", "ram://indexes/test-index");
         let source_id: SourceId = "test-source".to_string();
+        index_metadata.sources.insert(
+            source_id.clone(),
+            SourceConfig::for_test(&source_id, quickwit_config::SourceParams::void()),
+        );
 
         let source_uid = SourceUid {
             index_uid: index_uid.clone(),
@@ -2226,6 +2329,7 @@ mod tests {
                 assert_eq!(init_shard_request.subrequests.len(), 1);
                 let init_shard_subrequest: &InitShardSubrequest =
                     &init_shard_request.subrequests[0];
+                assert!(init_shard_subrequest.validate_docs);
                 Ok(InitShardsResponse {
                     successes: vec![InitShardSuccess {
                         subrequest_id: init_shard_subrequest.subrequest_id,
@@ -2310,6 +2414,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ingest_controller_disable_validation_when_vrl() {
+        let mut mock_metastore = MockMetastoreService::new();
+        mock_metastore
+            .expect_open_shards()
+            .once()
+            .returning(|request| {
+                let subrequest: &OpenShardSubrequest = &request.subrequests[0];
+                let shard = Shard {
+                    index_uid: subrequest.index_uid.clone(),
+                    source_id: subrequest.source_id.clone(),
+                    shard_id: subrequest.shard_id.clone(),
+                    shard_state: ShardState::Open as i32,
+                    leader_id: subrequest.leader_id.clone(),
+                    follower_id: subrequest.follower_id.clone(),
+                    doc_mapping_uid: subrequest.doc_mapping_uid,
+                    publish_position_inclusive: Some(Position::Beginning),
+                    publish_token: None,
+                    update_timestamp: 1724158996,
+                };
+                let response = OpenShardsResponse {
+                    subresponses: vec![OpenShardSubresponse {
+                        subrequest_id: subrequest.subrequest_id,
+                        open_shard: Some(shard),
+                    }],
+                };
+                Ok(response)
+            });
+        let metastore = MetastoreServiceClient::from_mock(mock_metastore);
+        let ingester_pool = IngesterPool::default();
+        let replication_factor = 1;
+
+        let mut controller = IngestController::new(
+            metastore,
+            ingester_pool.clone(),
+            replication_factor,
+            TEST_SHARD_THROUGHPUT_LIMIT_MIB,
+            1.001,
+        );
+
+        let index_uid = IndexUid::for_test("test-index", 0);
+        let mut index_metadata = IndexMetadata::for_test("test-index", "ram://indexes/test-index");
+        let source_id: SourceId = "test-source".to_string();
+        let mut source_config =
+            SourceConfig::for_test(&source_id, quickwit_config::SourceParams::void());
+        // set a vrl script
+        source_config.transform_config =
+            Some(quickwit_config::TransformConfig::new("".to_string(), None));
+        index_metadata
+            .sources
+            .insert(source_id.clone(), source_config);
+
+        let source_uid = SourceUid {
+            index_uid: index_uid.clone(),
+            source_id: source_id.clone(),
+        };
+        let mut model = ControlPlaneModel::default();
+        model.add_index(index_metadata);
+        let progress = Progress::default();
+
+        let shards = vec![Shard {
+            index_uid: Some(index_uid.clone()),
+            source_id: source_id.clone(),
+            shard_id: Some(ShardId::from(1)),
+            leader_id: "test-ingester".to_string(),
+            shard_state: ShardState::Open as i32,
+            ..Default::default()
+        }];
+        model.insert_shards(&index_uid, &source_id, shards);
+
+        let mut mock_ingester = MockIngesterService::new();
+
+        mock_ingester.expect_init_shards().returning(
+            move |init_shard_request: InitShardsRequest| {
+                assert_eq!(init_shard_request.subrequests.len(), 1);
+                let init_shard_subrequest: &InitShardSubrequest =
+                    &init_shard_request.subrequests[0];
+                // we have vrl, so no validation
+                assert!(!init_shard_subrequest.validate_docs);
+                Ok(InitShardsResponse {
+                    successes: vec![InitShardSuccess {
+                        subrequest_id: init_shard_subrequest.subrequest_id,
+                        shard: init_shard_subrequest.shard.clone(),
+                    }],
+                    failures: Vec::new(),
+                })
+            },
+        );
+
+        let ingester = IngesterServiceClient::from_mock(mock_ingester);
+        ingester_pool.insert("test-ingester".into(), ingester);
+
+        let shard_infos = BTreeSet::from_iter([ShardInfo {
+            shard_id: ShardId::from(1),
+            shard_state: ShardState::Open,
+            short_term_ingestion_rate: RateMibPerSec(4),
+            long_term_ingestion_rate: RateMibPerSec(4),
+        }]);
+        let local_shards_update = LocalShardsUpdate {
+            leader_id: "test-ingester".into(),
+            source_uid: source_uid.clone(),
+            shard_infos,
+        };
+
+        controller
+            .handle_local_shards_update(local_shards_update, &mut model, &progress)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn test_ingest_controller_try_scale_up_shards() {
         let mut mock_metastore = MockMetastoreService::new();
 
@@ -2361,6 +2575,7 @@ mod tests {
             ingester_pool.clone(),
             replication_factor,
             TEST_SHARD_THROUGHPUT_LIMIT_MIB,
+            1.001,
         );
 
         let index_uid = IndexUid::for_test("test-index", 0);
@@ -2384,9 +2599,9 @@ mod tests {
 
         let progress = Progress::default();
 
-        // Test could not find leader.
+        // Test could not find leader because no ingester in pool
         controller
-            .try_scale_up_shards(source_uid.clone(), shard_stats, &mut model, &progress)
+            .try_scale_up_shards(source_uid.clone(), shard_stats, &mut model, &progress, 1)
             .await
             .unwrap();
 
@@ -2438,21 +2653,21 @@ mod tests {
 
         // Test failed to open shards.
         controller
-            .try_scale_up_shards(source_uid.clone(), shard_stats, &mut model, &progress)
+            .try_scale_up_shards(source_uid.clone(), shard_stats, &mut model, &progress, 1)
             .await
             .unwrap();
         assert_eq!(model.all_shards().count(), 0);
 
         // Test failed to init shards.
         controller
-            .try_scale_up_shards(source_uid.clone(), shard_stats, &mut model, &progress)
+            .try_scale_up_shards(source_uid.clone(), shard_stats, &mut model, &progress, 1)
             .await
             .unwrap_err();
         assert_eq!(model.all_shards().count(), 0);
 
         // Test successfully opened shard.
         controller
-            .try_scale_up_shards(source_uid.clone(), shard_stats, &mut model, &progress)
+            .try_scale_up_shards(source_uid.clone(), shard_stats, &mut model, &progress, 1)
             .await
             .unwrap();
         assert_eq!(
@@ -2472,6 +2687,7 @@ mod tests {
             ingester_pool.clone(),
             replication_factor,
             TEST_SHARD_THROUGHPUT_LIMIT_MIB,
+            1.001,
         );
 
         let index_uid = IndexUid::for_test("test-index", 0);
@@ -2485,12 +2701,19 @@ mod tests {
             num_open_shards: 2,
             ..Default::default()
         };
+        let min_shards = NonZeroUsize::MIN;
         let mut model = ControlPlaneModel::default();
         let progress = Progress::default();
 
         // Test could not find a scale down candidate.
         controller
-            .try_scale_down_shards(source_uid.clone(), shard_stats, &mut model, &progress)
+            .try_scale_down_shards(
+                source_uid.clone(),
+                shard_stats,
+                min_shards,
+                &mut model,
+                &progress,
+            )
             .await
             .unwrap();
 
@@ -2506,7 +2729,13 @@ mod tests {
 
         // Test ingester is unavailable.
         controller
-            .try_scale_down_shards(source_uid.clone(), shard_stats, &mut model, &progress)
+            .try_scale_down_shards(
+                source_uid.clone(),
+                shard_stats,
+                min_shards,
+                &mut model,
+                &progress,
+            )
             .await
             .unwrap();
 
@@ -2546,14 +2775,26 @@ mod tests {
 
         // Test failed to close shard.
         controller
-            .try_scale_down_shards(source_uid.clone(), shard_stats, &mut model, &progress)
+            .try_scale_down_shards(
+                source_uid.clone(),
+                shard_stats,
+                min_shards,
+                &mut model,
+                &progress,
+            )
             .await
             .unwrap();
         assert!(model.all_shards().all(|shard| shard.is_open()));
 
         // Test successfully closed shard.
         controller
-            .try_scale_down_shards(source_uid.clone(), shard_stats, &mut model, &progress)
+            .try_scale_down_shards(
+                source_uid.clone(),
+                shard_stats,
+                min_shards,
+                &mut model,
+                &progress,
+            )
             .await
             .unwrap();
         assert!(model.all_shards().all(|shard| shard.is_closed()));
@@ -2570,7 +2811,13 @@ mod tests {
 
         // Test rate limited.
         controller
-            .try_scale_down_shards(source_uid.clone(), shard_stats, &mut model, &progress)
+            .try_scale_down_shards(
+                source_uid.clone(),
+                shard_stats,
+                min_shards,
+                &mut model,
+                &progress,
+            )
             .await
             .unwrap();
         assert!(model.all_shards().any(|shard| shard.is_open()));
@@ -2698,6 +2945,7 @@ mod tests {
             ingester_pool.clone(),
             replication_factor,
             TEST_SHARD_THROUGHPUT_LIMIT_MIB,
+            1.001,
         );
 
         let index_uid = IndexUid::for_test("test-index", 0);
@@ -2781,6 +3029,7 @@ mod tests {
             ingester_pool,
             replication_factor,
             TEST_SHARD_THROUGHPUT_LIMIT_MIB,
+            1.001,
         );
 
         let mut model = ControlPlaneModel::default();
@@ -2800,6 +3049,7 @@ mod tests {
         model.insert_shards(&index_uid, &source_id_00, shards);
 
         let advise_reset_shards_request = AdviseResetShardsRequest {
+            ingester_id: "test-ingester".to_string(),
             shard_ids: vec![
                 ShardIds {
                     index_uid: Some(index_uid.clone()),
@@ -2856,6 +3106,7 @@ mod tests {
             ingester_pool.clone(),
             replication_factor,
             TEST_SHARD_THROUGHPUT_LIMIT_MIB,
+            1.001,
         );
 
         let closed_shards = controller.close_shards(Vec::new()).await;
@@ -2925,46 +3176,41 @@ mod tests {
         // - ingester 3 will be unavailable.
 
         let shards_to_close = vec![
-            (
-                ingester_id_0.clone(),
-                ShardPKey {
-                    index_uid: Some(IndexUid::for_test("test-index", 0)),
-                    source_id: "test-source".to_string(),
-                    shard_id: Some(ShardId::from(0)),
-                },
-            ),
-            (
-                ingester_id_0,
-                ShardPKey {
-                    index_uid: Some(IndexUid::for_test("test-index", 0)),
-                    source_id: "test-source".to_string(),
-                    shard_id: Some(ShardId::from(1)),
-                },
-            ),
-            (
-                ingester_id_1,
-                ShardPKey {
-                    index_uid: Some(IndexUid::for_test("test-index", 0)),
-                    source_id: "test-source".to_string(),
-                    shard_id: Some(ShardId::from(2)),
-                },
-            ),
-            (
-                ingester_id_2,
-                ShardPKey {
-                    index_uid: Some(IndexUid::for_test("test-index", 0)),
-                    source_id: "test-source".to_string(),
-                    shard_id: Some(ShardId::from(3)),
-                },
-            ),
-            (
-                NodeId::from("test-ingester-3"),
-                ShardPKey {
-                    index_uid: Some(IndexUid::for_test("test-index", 0)),
-                    source_id: "test-source".to_string(),
-                    shard_id: Some(ShardId::from(4)),
-                },
-            ),
+            Shard {
+                index_uid: Some(IndexUid::for_test("test-index", 0)),
+                source_id: "test-source".to_string(),
+                shard_id: Some(ShardId::from(0)),
+                leader_id: ingester_id_0.to_string(),
+                ..Default::default()
+            },
+            Shard {
+                index_uid: Some(IndexUid::for_test("test-index", 0)),
+                source_id: "test-source".to_string(),
+                shard_id: Some(ShardId::from(1)),
+                leader_id: ingester_id_0.to_string(),
+                ..Default::default()
+            },
+            Shard {
+                index_uid: Some(IndexUid::for_test("test-index", 0)),
+                source_id: "test-source".to_string(),
+                shard_id: Some(ShardId::from(2)),
+                leader_id: ingester_id_1.to_string(),
+                ..Default::default()
+            },
+            Shard {
+                index_uid: Some(IndexUid::for_test("test-index", 0)),
+                source_id: "test-source".to_string(),
+                shard_id: Some(ShardId::from(3)),
+                leader_id: ingester_id_2.to_string(),
+                ..Default::default()
+            },
+            Shard {
+                index_uid: Some(IndexUid::for_test("test-index", 0)),
+                source_id: "test-source".to_string(),
+                shard_id: Some(ShardId::from(4)),
+                leader_id: "test-ingester-3".to_string(),
+                ..Default::default()
+            },
         ];
         let closed_shards = controller.close_shards(shards_to_close).await;
         assert_eq!(closed_shards.len(), 1);
@@ -3012,6 +3258,7 @@ mod tests {
             ingester_pool.clone(),
             replication_factor,
             TEST_SHARD_THROUGHPUT_LIMIT_MIB,
+            1.001,
         );
 
         let mut model = ControlPlaneModel::default();
@@ -3226,7 +3473,7 @@ mod tests {
     fn test_allocate_shards_aux(shard_counts: &[usize]) {
         let mut shard_counts_map: HashMap<NodeId, usize> = HashMap::new();
         let shards: Vec<String> = (0..shard_counts.len())
-            .map(|i| format!("shard-{}", i))
+            .map(|i| format!("shard-{i}"))
             .collect();
         for (shard, &shard_count) in shards.into_iter().zip(shard_counts.iter()) {
             shard_counts_map.insert(NodeId::from(shard), shard_count);
@@ -3294,5 +3541,143 @@ mod tests {
             &shard_counts.get(&2).unwrap()[..],
             &[NodeIdRef::from_str("node1"), NodeIdRef::from_str("node2")]
         );
+    }
+
+    fn test_compute_shards_to_rebalance_aux(shard_allocation: &[usize]) {
+        let index_id = "test-index";
+        let index_metadata = IndexMetadata::for_test(index_id, "ram://indexes/test-index");
+        let index_uid = index_metadata.index_uid.clone();
+        let source_id: SourceId = "test-source".to_string();
+
+        let mut model = ControlPlaneModel::default();
+        model.add_index(index_metadata.clone());
+
+        let mut source_config = SourceConfig::ingest_v2();
+        source_config.source_id = source_id.to_string();
+        model.add_source(&index_uid, source_config).unwrap();
+
+        let ingester_pool = IngesterPool::default();
+        let mock_ingester = MockIngesterService::new();
+        let ingester_client = IngesterServiceClient::from_mock(mock_ingester);
+
+        let ingester_ids: Vec<String> = (0..shard_allocation.len())
+            .map(|i| format!("test-ingester-{}", i))
+            .collect();
+
+        for ingester_id in &ingester_ids {
+            ingester_pool.insert(NodeId::from(ingester_id.clone()), ingester_client.clone());
+        }
+        let mut shards = Vec::new();
+
+        for (ingester_idx, &num_shards) in shard_allocation.iter().enumerate() {
+            for _ in 0..num_shards {
+                let shard_id = shards.len() as u64;
+                let shard = Shard {
+                    index_uid: Some(index_uid.clone()),
+                    source_id: source_id.to_string(),
+                    shard_id: Some(ShardId::from(shard_id)),
+                    leader_id: ingester_ids[ingester_idx].clone(),
+                    shard_state: ShardState::Open as i32,
+                    ..Default::default()
+                };
+                shards.push(shard);
+            }
+        }
+        model.insert_shards(&index_uid, &source_id, shards.clone());
+
+        let controller = IngestController::new(
+            MetastoreServiceClient::mocked(),
+            ingester_pool.clone(),
+            2, // replication_factor
+            TEST_SHARD_THROUGHPUT_LIMIT_MIB,
+            1.001,
+        );
+        let shards_to_rebalance = controller.compute_shards_to_rebalance(&model);
+
+        let source_uid = SourceUid {
+            index_uid: index_uid.clone(),
+            source_id: source_id.clone(),
+        };
+        let shard_ids_to_rebalance: Vec<ShardId> = shards_to_rebalance
+            .iter()
+            .flat_map(|shard| shard.shard_id.clone())
+            .collect();
+
+        let closed_shard_ids = model.close_shards(&source_uid, &shard_ids_to_rebalance);
+        assert_eq!(closed_shard_ids.len(), shards_to_rebalance.len());
+
+        let mut per_ingester_num_shards: HashMap<&str, usize> = HashMap::new();
+
+        for shard in model.all_shards() {
+            if shard.is_open() {
+                *per_ingester_num_shards.entry(&shard.leader_id).or_default() += 1;
+            }
+        }
+        for ingester_id in &ingester_ids {
+            per_ingester_num_shards
+                .entry(ingester_id.as_str())
+                .or_default();
+        }
+        let mut per_ingester_num_shards_sorted: BTreeSet<(usize, &str)> = per_ingester_num_shards
+            .into_iter()
+            .map(|(ingester_id, num_shards)| (num_shards, ingester_id))
+            .collect();
+        let mut opened_shards: Vec<Shard> = Vec::new();
+        let mut shard_id = shards.len() as u64;
+
+        for _ in 0..shards_to_rebalance.len() {
+            let (num_shards, ingester_id) = per_ingester_num_shards_sorted.pop_first().unwrap();
+            let opened_shard = Shard {
+                index_uid: Some(index_uid.clone()),
+                source_id: source_id.to_string(),
+                shard_id: Some(ShardId::from(shard_id)),
+                leader_id: ingester_id.to_string(),
+                shard_state: ShardState::Open as i32,
+                ..Default::default()
+            };
+            per_ingester_num_shards_sorted.insert((num_shards + 1, ingester_id));
+            opened_shards.push(opened_shard);
+            shard_id += 1;
+        }
+        let num_open_shards: usize = per_ingester_num_shards_sorted
+            .iter()
+            .map(|(num_shards, _)| num_shards)
+            .sum();
+        let target_num_open_shards_per_leader = num_open_shards as f32 / ingester_ids.len() as f32;
+        let max_num_open_shards_per_leader =
+            f32::ceil(target_num_open_shards_per_leader * 1.1) as usize;
+        let min_num_open_shards_per_leader =
+            f32::floor(target_num_open_shards_per_leader * 0.9) as usize;
+        assert!(
+            per_ingester_num_shards_sorted
+                .iter()
+                .all(
+                    |(num_shards, _)| *num_shards >= min_num_open_shards_per_leader
+                        && *num_shards <= max_num_open_shards_per_leader
+                )
+        );
+
+        // Test stability of the algorithm
+        model.insert_shards(&index_uid, &source_id, opened_shards);
+
+        let shards_to_rebalance = controller.compute_shards_to_rebalance(&model);
+        assert!(shards_to_rebalance.is_empty());
+    }
+
+    proptest! {
+        #[test]
+        fn test_compute_shards_to_rebalance_proptest(
+            shard_allocation in proptest::collection::vec(0..13usize, 0..13usize),
+        ) {
+            test_compute_shards_to_rebalance_aux(&shard_allocation);
+        }
+    }
+
+    #[test]
+    fn test_compute_shards_to_rebalance() {
+        test_compute_shards_to_rebalance_aux(&[]);
+        test_compute_shards_to_rebalance_aux(&[0]);
+        test_compute_shards_to_rebalance_aux(&[1]);
+        test_compute_shards_to_rebalance_aux(&[0, 1]);
     }
 }

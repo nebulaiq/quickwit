@@ -15,21 +15,13 @@ keep it open, just write `See #<Issue Number>`.
 Feel free to send your contribution in an unfinished state to get early feedback.
 In that case, simply mark the PR with the tag [WIP] (standing for work in progress).
 
-## Signing the CLA
-Quickwit is an open source project licensed under AGPLv3.
-It is also distributed under a commercial license by Quickwit, Inc.
-
-Contributors are required to sign a Contributor License Agreement.
-The process is simple and fast. Upon your first pull request, you will be prompted to
-[sign our CLA by visiting this link](https://cla-assistant.io/quickwit-oss/quickwit).
-
 ## PR verification checks
 When you submit a pull request to the project, the CI system runs several verification checks. After your PR is merged, a more exhaustive list of tests will be run.
 
 You will be notified by email from the CI system if any issues are discovered, but if you want to run these checks locally before submitting PR or in order to verify changes you can use the following commands in the root directory:
 1. To verify that all tests are passing, run `make test-all`.
 2. To fix code style and format as well as catch common mistakes run `make fix`. Alternatively, run `make -k test-all docker-compose-down` to tear down the Docker services after running all the tests.
-3. To build docs run `make build-docs`.
+3. To build docs run `make build-rustdoc`.
 
 # Development
 
@@ -58,7 +50,7 @@ Run `make test-all` to run all tests.
 * `make fmt` - runs formatter, this command requires the nightly toolchain to be installed by running `rustup toolchain install nightly`.
 * `make fix` - runs formatter and clippy checks.
 * `make typos` - runs the spellcheck tool over the codebase. (Install by running `cargo install typos-cli`)
-* `make docs` - builds docs.
+* `make doc` - builds docs.
 * `make docker-compose-up` - starts Docker services.
 * `make docker-compose-down` - stops Docker services.
 * `make docker-compose-logs` - shows Docker logs.
@@ -84,7 +76,7 @@ Run `make test-all` to run all tests.
 1. Ensure Docker and Docker Compose are correctly installed on your machine (see above)
 2. Start the Jaeger services (UI, collector, agent, ...) running the command `make docker-compose-up DOCKER_SERVICES=jaeger`
 3. Start Quickwit with the following environment variables:
-   
+
 ```
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
 QW_ENABLE_OPENTELEMETRY_OTLP_EXPORTER=true
@@ -115,6 +107,14 @@ As the react UI is embedded in the rust binary, we need to build the react app b
 ## Testing release (alpha, beta, rc)
 
 The following Quickwit installation command `curl -L https://install.quickwit.io | sh` always installs the latest stable version of quickwit. To make it easier in installing and testing new (alpha, beta, rc) releases, you can manually pull and execute the script as `./install.sh --allow-any-latest-version`. This will force the script to install any latest available release package.
+
+## Tracking licenses
+
+We keep track of the licenses used by the open source crates used by this project using
+[`rust-license-tool`](https://github.com/DataDog/rust-license-tool). The listing is checked every
+time CI is run. To update the listing, install the tool with `cargo install --git
+https://github.com/DataDog/rust-license-tool` and then run `dd-rust-license-tool write`. If there are
+any errors, you may need to update the listing of exceptions in `license-tool.toml`.
 
 # Documentation
 

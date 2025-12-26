@@ -1,23 +1,18 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-use std::ops::Bound;
+use std::ops::{Bound, RangeBounds};
 
 use prost::Message;
 use quickwit_proto::search::{
@@ -25,6 +20,7 @@ use quickwit_proto::search::{
 };
 use quickwit_proto::types::SplitId;
 use quickwit_storage::{MemorySizedCache, OwnedBytes};
+use tantivy::index::SegmentId;
 
 /// A cache to memoize `leaf_search_single_split` results.
 pub struct LeafSearchCache {
@@ -88,7 +84,7 @@ struct CacheKey {
     request: SearchRequest,
     /// The effective time range of the request, that is, the intersection of the timerange
     /// requested, and the timerange covered by the split.
-    merged_time_range: Range,
+    merged_time_range: HalfOpenRange,
 }
 
 impl CacheKey {
@@ -96,8 +92,8 @@ impl CacheKey {
         split_info: SplitIdAndFooterOffsets,
         mut search_request: SearchRequest,
     ) -> Self {
-        let split_time_range = Range::from_bounds(split_info.time_range());
-        let request_time_range = Range::from_bounds(search_request.time_range());
+        let split_time_range = HalfOpenRange::from_bounds(split_info.time_range());
+        let request_time_range = HalfOpenRange::from_bounds(search_request.time_range());
         let merged_time_range = request_time_range.intersect(&split_time_range);
 
         search_request.start_timestamp = None;
@@ -115,20 +111,22 @@ impl CacheKey {
 }
 
 /// A (half-open) range bounded inclusively below and exclusively above [start..end).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct Range {
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+struct HalfOpenRange {
     start: i64,
     end: Option<i64>,
 }
 
-impl Range {
-    /// Create a Range from bounds.
-    fn from_bounds(range: impl std::ops::RangeBounds<i64>) -> Self {
-        let empty_range = Range {
+impl HalfOpenRange {
+    fn empty_range() -> HalfOpenRange {
+        HalfOpenRange {
             start: 0,
             end: Some(0),
-        };
+        }
+    }
 
+    /// Create a Range from bounds.
+    fn from_bounds(range: impl RangeBounds<i64>) -> Self {
         let start = match range.start_bound() {
             Bound::Included(start) => *start,
             Bound::Excluded(start) => {
@@ -136,7 +134,7 @@ impl Range {
                 if let Some(start) = start.checked_add(1) {
                     start
                 } else {
-                    return empty_range;
+                    return Self::empty_range();
                 }
             }
             Bound::Unbounded => i64::MIN,
@@ -148,51 +146,98 @@ impl Range {
             Bound::Unbounded => None,
         };
 
-        Range { start, end }
+        HalfOpenRange { start, end }.normalize()
+    }
+
+    fn is_empty(self) -> bool {
+        !self.contains(&self.start)
     }
 
     /// Normalize empty ranges to be 0..0
-    fn normalize(self) -> Range {
-        let empty_range = Range {
-            start: 0,
-            end: Some(0),
-        };
-        match self {
-            Range {
-                start,
-                end: Some(end),
-            } if start >= end => empty_range,
-            any => any,
+    fn normalize(self) -> HalfOpenRange {
+        if self.is_empty() {
+            Self::empty_range()
+        } else {
+            self
         }
     }
 
     /// Return the intersection of self and other.
-    fn intersect(&self, other: &Range) -> Range {
+    fn intersect(&self, other: &HalfOpenRange) -> HalfOpenRange {
         let start = self.start.max(other.start);
-
         let end = match (self.end, other.end) {
             (Some(this), Some(other)) => Some(this.min(other)),
             (Some(this), None) => Some(this),
             (None, other) => other,
         };
-        Range { start, end }.normalize()
+        HalfOpenRange { start, end }.normalize()
     }
 }
 
-impl std::ops::RangeBounds<i64> for Range {
+impl RangeBounds<i64> for HalfOpenRange {
     fn start_bound(&self) -> Bound<&i64> {
         Bound::Included(&self.start)
     }
 
     fn end_bound(&self) -> Bound<&i64> {
-        self.end.as_ref().map_or(Bound::Unbounded, Bound::Excluded)
+        if let Some(end_bound) = &self.end {
+            Bound::Excluded(end_bound)
+        } else {
+            Bound::Unbounded
+        }
+    }
+}
+
+pub struct PredicateCacheImpl {
+    content: MemorySizedCache<(SplitId, String)>,
+}
+
+impl PredicateCacheImpl {
+    pub fn new(capacity: usize) -> Self {
+        PredicateCacheImpl {
+            content: MemorySizedCache::with_capacity_in_bytes(
+                capacity,
+                &quickwit_storage::STORAGE_METRICS.predicate_cache,
+            ),
+        }
+    }
+}
+
+impl quickwit_query::query_ast::PredicateCache for PredicateCacheImpl {
+    fn get(
+        &self,
+        split_id: SplitId,
+        query_ast_json: String,
+    ) -> Option<(SegmentId, quickwit_query::query_ast::HitSet)> {
+        let encoded_result = self.content.get(&(split_id, query_ast_json))?;
+        let (segment_id_bytes, hits_buffer) = encoded_result.split(32);
+        let segment_id =
+            SegmentId::from_uuid_string(str::from_utf8(&segment_id_bytes).ok()?).ok()?;
+        let hits = quickwit_query::query_ast::HitSet::from_buffer(hits_buffer);
+        Some((segment_id, hits))
+    }
+
+    fn put(
+        &self,
+        split_id: SplitId,
+        query_ast_json: String,
+        segment: SegmentId,
+        hits: quickwit_query::query_ast::HitSet,
+    ) {
+        let hits_buffer = hits.into_buffer();
+        let mut buffer = Vec::with_capacity(32 + hits_buffer.len());
+        buffer.extend_from_slice(segment.uuid_string().as_bytes());
+        buffer.extend_from_slice(&hits_buffer);
+        self.content
+            .put((split_id, query_ast_json), OwnedBytes::new(buffer));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use quickwit_proto::search::{
-        LeafSearchResponse, PartialHit, SearchRequest, SortValue, SplitIdAndFooterOffsets,
+        LeafSearchResponse, PartialHit, ResourceStats, SearchRequest, SortValue,
+        SplitIdAndFooterOffsets,
     };
 
     use super::LeafSearchCache;
@@ -242,7 +287,8 @@ mod tests {
         let result = LeafSearchResponse {
             failed_splits: Vec::new(),
             intermediate_aggregation_result: None,
-            num_attempted_splits: 0,
+            num_attempted_splits: 1,
+            num_successful_splits: 1,
             num_hits: 1234,
             partial_hits: vec![PartialHit {
                 doc_id: 1,
@@ -251,6 +297,7 @@ mod tests {
                 sort_value2: None,
                 split_id: "split_1".to_string(),
             }],
+            resource_stats: None,
         };
 
         assert!(cache.get(split_1.clone(), query_1.clone()).is_none());
@@ -331,7 +378,8 @@ mod tests {
         let result = LeafSearchResponse {
             failed_splits: Vec::new(),
             intermediate_aggregation_result: None,
-            num_attempted_splits: 0,
+            num_attempted_splits: 1,
+            num_successful_splits: 1,
             num_hits: 1234,
             partial_hits: vec![PartialHit {
                 doc_id: 1,
@@ -340,6 +388,7 @@ mod tests {
                 sort_value2: None,
                 split_id: "split_1".to_string(),
             }],
+            resource_stats: Some(ResourceStats::default()),
         };
 
         // for split_1, 1 and 1bis cover different timestamp ranges

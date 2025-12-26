@@ -1,24 +1,19 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
@@ -27,8 +22,8 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use async_trait::async_trait;
 use bytesize::ByteSize;
-use futures::stream::FuturesUnordered;
 use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use mrecordlog::error::CreateQueueError;
 use once_cell::sync::OnceCell;
 use quickwit_cluster::Cluster;
@@ -37,7 +32,7 @@ use quickwit_common::pretty::PrettyDisplay;
 use quickwit_common::pubsub::{EventBroker, EventSubscriber};
 use quickwit_common::rate_limiter::{RateLimiter, RateLimiterSettings};
 use quickwit_common::tower::Pool;
-use quickwit_common::{rate_limited_error, rate_limited_warn, ServiceStream};
+use quickwit_common::{ServiceStream, rate_limited_error, rate_limited_warn};
 use quickwit_proto::control_plane::{
     AdviseResetShardsRequest, ControlPlaneService, ControlPlaneServiceClient,
 };
@@ -57,13 +52,14 @@ use quickwit_proto::ingest::{
     ShardState,
 };
 use quickwit_proto::types::{
-    queue_id, split_queue_id, IndexUid, NodeId, Position, QueueId, ShardId, SourceId, SubrequestId,
+    IndexUid, NodeId, Position, QueueId, ShardId, SourceId, SubrequestId, queue_id, split_queue_id,
 };
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 use tokio::sync::Semaphore;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, warn};
 
+use super::IngesterPool;
 use super::broadcast::BroadcastLocalShardsTask;
 use super::doc_mapper::validate_doc_batch;
 use super::fetch::FetchStreamTask;
@@ -71,7 +67,7 @@ use super::idle::CloseIdleShardsTask;
 use super::metrics::INGEST_V2_METRICS;
 use super::models::IngesterShard;
 use super::mrecordlog_utils::{
-    append_non_empty_doc_batch, check_enough_capacity, AppendDocBatchError,
+    AppendDocBatchError, append_non_empty_doc_batch, check_enough_capacity,
 };
 use super::rate_meter::RateMeter;
 use super::replication::{
@@ -79,12 +75,11 @@ use super::replication::{
     SYN_REPLICATION_STREAM_CAPACITY,
 };
 use super::state::{IngesterState, InnerIngesterState, WeakIngesterState};
-use super::IngesterPool;
 use crate::ingest_v2::doc_mapper::get_or_try_build_doc_mapper;
 use crate::ingest_v2::metrics::report_wal_usage;
 use crate::ingest_v2::models::IngesterShardType;
 use crate::mrecordlog_async::MultiRecordLogAsync;
-use crate::{estimate_size, with_lock_metrics, FollowerId};
+use crate::{FollowerId, estimate_size, with_lock_metrics};
 
 /// Minimum interval between two reset shards operations.
 const MIN_RESET_SHARDS_INTERVAL: Duration = if cfg!(any(test, feature = "testsuite")) {
@@ -106,7 +101,7 @@ const DEFAULT_BATCH_NUM_BYTES: usize = 1024 * 1024; // 1 MiB
 fn get_batch_num_bytes() -> usize {
     static BATCH_NUM_BYTES_CELL: OnceCell<usize> = OnceCell::new();
     *BATCH_NUM_BYTES_CELL.get_or_init(|| {
-        quickwit_common::get_from_env("QW_INGEST_BATCH_NUM_BYTES", DEFAULT_BATCH_NUM_BYTES)
+        quickwit_common::get_from_env("QW_INGEST_BATCH_NUM_BYTES", DEFAULT_BATCH_NUM_BYTES, false)
     })
 }
 
@@ -192,6 +187,7 @@ impl Ingester {
         shard: Shard,
         doc_mapping_json: &str,
         now: Instant,
+        validate: bool,
     ) -> IngestV2Result<()> {
         let queue_id = shard.queue_id();
         info!(
@@ -252,6 +248,7 @@ impl Ingester {
                 Position::Beginning,
                 doc_mapper,
                 now,
+                validate,
             )
         } else {
             IngesterShard::new_solo(
@@ -260,6 +257,7 @@ impl Ingester {
                 Position::Beginning,
                 Some(doc_mapper),
                 now,
+                validate,
             )
         };
         entry.insert(primary_shard);
@@ -315,7 +313,10 @@ impl Ingester {
             })
             .collect();
 
-        let advise_reset_shards_request = AdviseResetShardsRequest { shard_ids };
+        let advise_reset_shards_request = AdviseResetShardsRequest {
+            ingester_id: self.self_node_id.to_string(),
+            shard_ids,
+        };
         let advise_reset_shards_future = self
             .control_plane
             .advise_reset_shards(advise_reset_shards_request);
@@ -516,6 +517,7 @@ impl Ingester {
                     continue;
                 }
                 let doc_mapper = shard.doc_mapper_opt.clone().expect("shard should be open");
+                let validate_docs = shard.validate_docs;
                 let follower_id_opt = shard.follower_id_opt().cloned();
                 let from_position_exclusive = shard.replication_position_inclusive.clone();
 
@@ -570,8 +572,12 @@ impl Ingester {
 
                 // Total number of bytes (valid and invalid documents)
                 let original_batch_num_bytes = doc_batch.num_bytes() as u64;
-                let (valid_doc_batch, parse_failures) =
-                    validate_doc_batch(doc_batch, doc_mapper).await?;
+
+                let (valid_doc_batch, parse_failures) = if validate_docs {
+                    validate_doc_batch(doc_batch, doc_mapper).await?
+                } else {
+                    (doc_batch, Vec::new())
+                };
 
                 if valid_doc_batch.is_empty() {
                     crate::metrics::INGEST_METRICS
@@ -759,13 +765,13 @@ impl Ingester {
                     }
                 };
 
-                if let Some(expected_position_inclusive) = subrequest.expected_position_inclusive {
-                    if expected_position_inclusive != current_position_inclusive {
-                        return Err(IngestV2Error::Internal(format!(
-                            "bad replica position: expected {expected_position_inclusive:?}, got \
-                             {current_position_inclusive:?}"
-                        )));
-                    }
+                if let Some(expected_position_inclusive) = subrequest.expected_position_inclusive
+                    && expected_position_inclusive != current_position_inclusive
+                {
+                    return Err(IngestV2Error::Internal(format!(
+                        "bad replica position: expected {expected_position_inclusive:?}, got \
+                         {current_position_inclusive:?}"
+                    )));
                 }
                 state_guard
                     .shards
@@ -947,6 +953,7 @@ impl Ingester {
                     subrequest.shard().clone(),
                     &subrequest.doc_mapping_json,
                     now,
+                    subrequest.validate_docs,
                 )
                 .await;
             if init_primary_shard_result.is_ok() {
@@ -991,10 +998,10 @@ impl Ingester {
             let truncate_up_to_position_inclusive = subrequest.truncate_up_to_position_inclusive();
 
             if truncate_up_to_position_inclusive.is_eof() {
-                state_guard.delete_shard(&queue_id).await;
+                state_guard.delete_shard(&queue_id, "indexer-rpc").await;
             } else {
                 state_guard
-                    .truncate_shard(&queue_id, truncate_up_to_position_inclusive)
+                    .truncate_shard(&queue_id, truncate_up_to_position_inclusive, "indexer-rpc")
                     .await;
             }
         }
@@ -1050,12 +1057,12 @@ impl Ingester {
             Err(_) => {
                 return json!({
                     "status": "initializing",
-                    "shards": [],
+                    "shards": {},
                     "mrecordlog": {},
-                })
+                });
             }
         };
-        let mut per_index_shards_json: HashMap<IndexUid, Vec<JsonValue>> = HashMap::new();
+        let mut per_index_shards_json: BTreeMap<IndexUid, Vec<JsonValue>> = BTreeMap::new();
 
         for (queue_id, shard) in &state_guard.shards {
             let Some((index_uid, source_id, shard_id)) = split_queue_id(queue_id) else {
@@ -1175,7 +1182,9 @@ impl IngesterService for Ingester {
             .collect();
         info!(queues=?remove_queue_ids, "removing queues");
         for queue_id in remove_queue_ids {
-            state_guard.delete_shard(&queue_id).await;
+            state_guard
+                .delete_shard(&queue_id, "control-plane-retain-shards-rpc")
+                .await;
         }
         self.check_decommissioning_status(&mut state_guard);
         Ok(RetainShardsResponse {})
@@ -1222,9 +1231,11 @@ impl EventSubscriber<ShardPositionsUpdate> for WeakIngesterState {
         for (shard_id, shard_position) in shard_positions_update.updated_shard_positions {
             let queue_id = queue_id(&index_uid, &source_id, &shard_id);
             if shard_position.is_eof() {
-                state_guard.delete_shard(&queue_id).await;
+                state_guard.delete_shard(&queue_id, "indexer-gossip").await;
             } else if !shard_position.is_beginning() {
-                state_guard.truncate_shard(&queue_id, shard_position).await;
+                state_guard
+                    .truncate_shard(&queue_id, shard_position, "indexer-gossip")
+                    .await;
             }
         }
     }
@@ -1288,7 +1299,7 @@ mod tests {
     use std::sync::atomic::{AtomicU16, Ordering};
 
     use bytes::Bytes;
-    use quickwit_cluster::{create_cluster_for_test_with_id, ChannelTransport};
+    use quickwit_cluster::{ChannelTransport, create_cluster_for_test_with_id};
     use quickwit_common::shared_consts::INGESTER_PRIMARY_SHARDS_PREFIX;
     use quickwit_common::tower::ConstantRate;
     use quickwit_config::service::QuickwitService;
@@ -1300,17 +1311,17 @@ mod tests {
     use quickwit_proto::ingest::{
         DocBatchV2, ParseFailureReason, ShardIdPosition, ShardIdPositions, ShardIds, ShardPKey,
     };
-    use quickwit_proto::types::{queue_id, DocMappingUid, DocUid, ShardId, SourceUid};
+    use quickwit_proto::types::{DocMappingUid, DocUid, ShardId, SourceUid, queue_id};
     use tokio::task::yield_now;
     use tokio::time::timeout;
     use tonic::transport::{Endpoint, Server};
 
     use super::*;
+    use crate::MRecord;
+    use crate::ingest_v2::DEFAULT_IDLE_SHARD_TIMEOUT;
     use crate::ingest_v2::broadcast::ShardInfos;
     use crate::ingest_v2::doc_mapper::try_build_doc_mapper;
     use crate::ingest_v2::fetch::tests::{into_fetch_eof, into_fetch_payload};
-    use crate::ingest_v2::DEFAULT_IDLE_SHARD_TIMEOUT;
-    use crate::MRecord;
 
     const MAX_GRPC_MESSAGE_SIZE: ByteSize = ByteSize::mib(1);
 
@@ -1551,6 +1562,7 @@ mod tests {
             Position::Beginning,
             None,
             Instant::now(),
+            false,
         );
         state_guard.shards.insert(queue_id_00.clone(), shard_00);
 
@@ -1561,6 +1573,7 @@ mod tests {
             Position::Beginning,
             None,
             Instant::now(),
+            false,
         );
         shard_01.is_advertisable = true;
         state_guard.shards.insert(queue_id_01.clone(), shard_01);
@@ -1652,6 +1665,7 @@ mod tests {
                 primary_shard,
                 &doc_mapping_json,
                 Instant::now(),
+                true,
             )
             .await
             .unwrap();
@@ -1687,12 +1701,14 @@ mod tests {
             doc_mapping_uid: Some(doc_mapping_uid),
             publish_position_inclusive: None,
             publish_token: None,
+            update_timestamp: 1724158996,
         };
         let init_shards_request = InitShardsRequest {
             subrequests: vec![InitShardSubrequest {
                 subrequest_id: 0,
                 shard: Some(shard.clone()),
                 doc_mapping_json,
+                validate_docs: true,
             }],
         };
         let response = ingester.init_shards(init_shards_request).await.unwrap();
@@ -1743,6 +1759,7 @@ mod tests {
                         ..Default::default()
                     }),
                     doc_mapping_json: doc_mapping_json.clone(),
+                    validate_docs: true,
                 },
                 InitShardSubrequest {
                     subrequest_id: 1,
@@ -1756,6 +1773,7 @@ mod tests {
                         ..Default::default()
                     }),
                     doc_mapping_json,
+                    validate_docs: true,
                 },
             ],
         };
@@ -1866,6 +1884,7 @@ mod tests {
                     ..Default::default()
                 }),
                 doc_mapping_json,
+                validate_docs: true,
             }],
         };
         let response = ingester.init_shards(init_shards_request).await.unwrap();
@@ -1936,6 +1955,7 @@ mod tests {
                     ..Default::default()
                 }),
                 doc_mapping_json,
+                validate_docs: true,
             }],
         };
         let response = ingester.init_shards(init_shards_request).await.unwrap();
@@ -1984,6 +2004,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ingester_persist_doesnt_validates_docs_when_requested() {
+        let (ingester_ctx, ingester) = IngesterForTest::default().build().await;
+
+        let index_uid: IndexUid = IndexUid::for_test("test-index", 0);
+
+        let doc_mapping_uid = DocMappingUid::random();
+        let doc_mapping_json = format!(
+            r#"{{
+                "doc_mapping_uid": "{doc_mapping_uid}",
+                "mode": "strict",
+                "field_mappings": [{{"name": "doc", "type": "text"}}]
+            }}"#
+        );
+        let init_shards_request = InitShardsRequest {
+            subrequests: vec![InitShardSubrequest {
+                subrequest_id: 0,
+                shard: Some(Shard {
+                    index_uid: Some(index_uid.clone()),
+                    source_id: "test-source".to_string(),
+                    shard_id: Some(ShardId::from(0)),
+                    shard_state: ShardState::Open as i32,
+                    leader_id: ingester_ctx.node_id.to_string(),
+                    doc_mapping_uid: Some(doc_mapping_uid),
+                    ..Default::default()
+                }),
+                doc_mapping_json,
+                validate_docs: false,
+            }],
+        };
+        let response = ingester.init_shards(init_shards_request).await.unwrap();
+        assert_eq!(response.successes.len(), 1);
+        assert_eq!(response.failures.len(), 0);
+
+        let persist_request = PersistRequest {
+            leader_id: ingester_ctx.node_id.to_string(),
+            commit_type: CommitTypeV2::Force as i32,
+            subrequests: vec![PersistSubrequest {
+                subrequest_id: 0,
+                index_uid: Some(index_uid.clone()),
+                source_id: "test-source".to_string(),
+                shard_id: Some(ShardId::from(0)),
+                doc_batch: Some(DocBatchV2::for_test([
+                    "",                           // invalid
+                    "[]",                         // invalid
+                    r#"{"foo": "bar"}"#,          // invalid
+                    r#"{"doc": "test-doc-000"}"#, // valid
+                ])),
+            }],
+        };
+        let persist_response = ingester.persist(persist_request).await.unwrap();
+        assert_eq!(persist_response.leader_id, "test-ingester");
+        assert_eq!(persist_response.successes.len(), 1);
+        assert_eq!(persist_response.failures.len(), 0);
+
+        let persist_success = &persist_response.successes[0];
+        assert_eq!(persist_success.num_persisted_docs, 4);
+        assert_eq!(persist_success.parse_failures.len(), 0);
+    }
+
+    #[tokio::test]
     async fn test_ingester_persist_checks_capacity_before_validating_docs() {
         let (ingester_ctx, ingester) = IngesterForTest::default()
             .with_memory_capacity(ByteSize(0))
@@ -2013,6 +2093,7 @@ mod tests {
                     ..Default::default()
                 }),
                 doc_mapping_json,
+                validate_docs: true,
             }],
         };
         let response = ingester.init_shards(init_shards_request).await.unwrap();
@@ -2073,6 +2154,7 @@ mod tests {
                     ..Default::default()
                 }),
                 doc_mapping_json,
+                validate_docs: true,
             }],
         };
         let response = ingester.init_shards(init_shards_request).await.unwrap();
@@ -2124,6 +2206,7 @@ mod tests {
             Position::Beginning,
             None,
             Instant::now(),
+            false,
         );
         state_guard.shards.insert(queue_id.clone(), solo_shard);
 
@@ -2189,6 +2272,7 @@ mod tests {
             Position::Beginning,
             Some(doc_mapper),
             Instant::now(),
+            false,
         );
         state_guard.shards.insert(queue_id.clone(), solo_shard);
 
@@ -2275,6 +2359,7 @@ mod tests {
                         ..Default::default()
                     }),
                     doc_mapping_json: doc_mapping_json.clone(),
+                    validate_docs: true,
                 },
                 InitShardSubrequest {
                     subrequest_id: 1,
@@ -2289,6 +2374,7 @@ mod tests {
                         ..Default::default()
                     }),
                     doc_mapping_json,
+                    validate_docs: true,
                 },
             ],
         };
@@ -2450,6 +2536,7 @@ mod tests {
             "127.0.0.1:7777".parse().unwrap(),
             follower_channel,
             MAX_GRPC_MESSAGE_SIZE,
+            None,
         );
 
         leader_ctx
@@ -2480,6 +2567,7 @@ mod tests {
                         ..Default::default()
                     }),
                     doc_mapping_json: doc_mapping_json.clone(),
+                    validate_docs: true,
                 },
                 InitShardSubrequest {
                     subrequest_id: 1,
@@ -2494,6 +2582,7 @@ mod tests {
                         ..Default::default()
                     }),
                     doc_mapping_json,
+                    validate_docs: true,
                 },
             ],
         };
@@ -2617,6 +2706,7 @@ mod tests {
             Position::Beginning,
             None,
             Instant::now(),
+            false,
         );
         ingester
             .state
@@ -2695,6 +2785,7 @@ mod tests {
                 primary_shard,
                 &doc_mapping_json,
                 Instant::now(),
+                true,
             )
             .await
             .unwrap();
@@ -2775,6 +2866,7 @@ mod tests {
                 primary_shard,
                 &doc_mapping_json,
                 Instant::now(),
+                true,
             )
             .await
             .unwrap();
@@ -2897,6 +2989,7 @@ mod tests {
                 shard,
                 &doc_mapping_json,
                 Instant::now(),
+                true,
             )
             .await
             .unwrap();
@@ -3021,6 +3114,7 @@ mod tests {
                 shard_01,
                 &doc_mapping_json_01,
                 now,
+                true,
             )
             .await
             .unwrap();
@@ -3031,6 +3125,7 @@ mod tests {
                 shard_02,
                 &doc_mapping_json_02,
                 now,
+                true,
             )
             .await
             .unwrap();
@@ -3121,6 +3216,7 @@ mod tests {
             Position::Beginning,
             None,
             Instant::now(),
+            false,
         );
         state_guard.shards.insert(queue_id.clone(), solo_shard);
 
@@ -3163,6 +3259,7 @@ mod tests {
             .expect_advise_reset_shards()
             .once()
             .returning(|mut request| {
+                assert_eq!(request.ingester_id, "test-ingester");
                 assert_eq!(request.shard_ids.len(), 1);
                 assert_eq!(request.shard_ids[0].index_uid(), &("test-index", 0));
                 assert_eq!(request.shard_ids[0].source_id, "test-source");
@@ -3231,6 +3328,7 @@ mod tests {
                 shard_01,
                 &doc_mapping_json,
                 now,
+                true,
             )
             .await
             .unwrap();
@@ -3241,6 +3339,7 @@ mod tests {
                 shard_02,
                 &doc_mapping_json,
                 now,
+                true,
             )
             .await
             .unwrap();
@@ -3313,6 +3412,7 @@ mod tests {
                 shard_17,
                 &doc_mapping_json,
                 now,
+                true,
             )
             .await
             .unwrap();
@@ -3324,6 +3424,7 @@ mod tests {
                 shard_18,
                 &doc_mapping_json,
                 now,
+                true,
             )
             .await
             .unwrap();
@@ -3381,6 +3482,7 @@ mod tests {
                 shard,
                 &doc_mapping_json,
                 Instant::now(),
+                true,
             )
             .await
             .unwrap();
@@ -3494,6 +3596,7 @@ mod tests {
                 Position::Beginning,
                 None,
                 Instant::now(),
+                false,
             ),
         );
         ingester.check_decommissioning_status(&mut state_guard);
@@ -3550,6 +3653,7 @@ mod tests {
                 shard_01,
                 &doc_mapping_json,
                 now,
+                true,
             )
             .await
             .unwrap();
@@ -3560,6 +3664,7 @@ mod tests {
                 shard_02,
                 &doc_mapping_json,
                 now,
+                true,
             )
             .await
             .unwrap();
@@ -3655,6 +3760,7 @@ mod tests {
                 shard_01,
                 &doc_mapping_json,
                 now - idle_shard_timeout,
+                true,
             )
             .await
             .unwrap();
@@ -3722,6 +3828,7 @@ mod tests {
                 shard_01,
                 &doc_mapping_json,
                 now,
+                true,
             )
             .await
             .unwrap();
@@ -3732,6 +3839,7 @@ mod tests {
                 shard_02,
                 &doc_mapping_json,
                 now,
+                true,
             )
             .await
             .unwrap();
@@ -3742,6 +3850,7 @@ mod tests {
                 shard_03,
                 &doc_mapping_json,
                 now,
+                true,
             )
             .await
             .unwrap();

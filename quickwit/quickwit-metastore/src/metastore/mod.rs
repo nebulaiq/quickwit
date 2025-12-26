@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 pub mod file_backed;
 pub(crate) mod index_metadata;
@@ -24,6 +19,7 @@ pub mod postgres;
 
 pub mod control_plane_metastore;
 
+use std::cmp::Ordering;
 use std::ops::{Bound, RangeInclusive};
 
 use async_trait::async_trait;
@@ -33,16 +29,16 @@ pub use index_metadata::IndexMetadata;
 use itertools::Itertools;
 use quickwit_common::thread_pool::run_cpu_intensive;
 use quickwit_config::{
-    DocMapping, FileSourceParams, IndexConfig, IndexingSettings, RetentionPolicy, SearchSettings,
-    SourceConfig, SourceParams,
+    DocMapping, FileSourceParams, IndexConfig, IndexingSettings, IngestSettings, RetentionPolicy,
+    SearchSettings, SourceConfig, SourceParams,
 };
 use quickwit_doc_mapper::tag_pruning::TagFilterAst;
 use quickwit_proto::metastore::{
-    serde_utils, AddSourceRequest, CreateIndexRequest, CreateIndexResponse, DeleteTask,
-    IndexMetadataFailure, IndexMetadataRequest, IndexMetadataResponse, IndexesMetadataResponse,
+    AddSourceRequest, CreateIndexRequest, CreateIndexResponse, DeleteTask, IndexMetadataFailure,
+    IndexMetadataRequest, IndexMetadataResponse, IndexesMetadataResponse,
     ListIndexesMetadataResponse, ListSplitsRequest, ListSplitsResponse, MetastoreError,
     MetastoreResult, MetastoreService, MetastoreServiceClient, MetastoreServiceStream,
-    PublishSplitsRequest, StageSplitsRequest, UpdateIndexRequest,
+    PublishSplitsRequest, StageSplitsRequest, UpdateIndexRequest, UpdateSourceRequest, serde_utils,
 };
 use quickwit_proto::types::{IndexUid, NodeId, SplitId};
 use time::OffsetDateTime;
@@ -87,7 +83,7 @@ impl MetastoreServiceStreamSplitsExt for MetastoreServiceStream<ListSplitsRespon
     async fn collect_splits(mut self) -> MetastoreResult<Vec<Split>> {
         let mut all_splits = Vec::new();
         while let Some(list_splits_response) = self.try_next().await? {
-            let splits = list_splits_response.deserialize_splits()?;
+            let splits = list_splits_response.deserialize_splits().await?;
             all_splits.extend(splits);
         }
         Ok(all_splits)
@@ -96,7 +92,7 @@ impl MetastoreServiceStreamSplitsExt for MetastoreServiceStream<ListSplitsRespon
     async fn collect_splits_metadata(mut self) -> MetastoreResult<Vec<SplitMetadata>> {
         let mut all_splits_metadata = Vec::new();
         while let Some(list_splits_response) = self.try_next().await? {
-            let splits_metadata = list_splits_response.deserialize_splits_metadata()?;
+            let splits_metadata = list_splits_response.deserialize_splits_metadata().await?;
             all_splits_metadata.extend(splits_metadata);
         }
         Ok(all_splits_metadata)
@@ -105,7 +101,7 @@ impl MetastoreServiceStreamSplitsExt for MetastoreServiceStream<ListSplitsRespon
     async fn collect_split_ids(mut self) -> MetastoreResult<Vec<SplitId>> {
         let mut all_splits = Vec::new();
         while let Some(list_splits_response) = self.try_next().await? {
-            let splits = list_splits_response.deserialize_split_ids()?;
+            let splits = list_splits_response.deserialize_split_ids().await?;
             all_splits.extend(splits);
         }
         Ok(all_splits)
@@ -189,11 +185,24 @@ pub trait UpdateIndexRequestExt {
     /// Creates a new [`UpdateIndexRequest`] from the different updated fields.
     fn try_from_updates(
         index_uid: impl Into<IndexUid>,
+        doc_mapping: &DocMapping,
+        indexing_settings: &IndexingSettings,
+        ingest_settings: &IngestSettings,
         search_settings: &SearchSettings,
         retention_policy_opt: &Option<RetentionPolicy>,
-        indexing_settings: &IndexingSettings,
-        doc_mapping: &DocMapping,
     ) -> MetastoreResult<UpdateIndexRequest>;
+
+    /// Deserializes the `doc_mapping_json` field of an `[UpdateIndexRequest]` into a
+    /// [`DocMapping`] object.
+    fn deserialize_doc_mapping(&self) -> MetastoreResult<DocMapping>;
+
+    /// Deserializes the `indexing_settings_json` field of an [`UpdateIndexRequest`] into a
+    /// [`IndexingSettings`] object.
+    fn deserialize_indexing_settings(&self) -> MetastoreResult<IndexingSettings>;
+
+    /// Deserializes the `ingest_settings_json` field of an [`UpdateIndexRequest`] into a
+    /// [`IngestSettings`] object.
+    fn deserialize_ingest_settings(&self) -> MetastoreResult<IngestSettings>;
 
     /// Deserializes the `search_settings_json` field of an [`UpdateIndexRequest`] into a
     /// [`SearchSettings`] object.
@@ -202,40 +211,46 @@ pub trait UpdateIndexRequestExt {
     /// Deserializes the `retention_policy_json` field of an [`UpdateIndexRequest`] into a
     /// [`RetentionPolicy`] object.
     fn deserialize_retention_policy(&self) -> MetastoreResult<Option<RetentionPolicy>>;
-
-    /// Deserializes the `indexing_settings_json` field of an [`UpdateIndexRequest`] into a
-    /// [`IndexingSettings`] object.
-    fn deserialize_indexing_settings(&self) -> MetastoreResult<IndexingSettings>;
-
-    /// Deserilalize the `doc_mapping_json` field of an `[UpdateIndexRequest]` into a
-    /// [`DocMapping`] object.
-    fn deserialize_doc_mapping(&self) -> MetastoreResult<DocMapping>;
 }
 
 impl UpdateIndexRequestExt for UpdateIndexRequest {
     fn try_from_updates(
         index_uid: impl Into<IndexUid>,
+        doc_mapping: &DocMapping,
+        indexing_settings: &IndexingSettings,
+        ingest_settings: &IngestSettings,
         search_settings: &SearchSettings,
         retention_policy_opt: &Option<RetentionPolicy>,
-        indexing_settings: &IndexingSettings,
-        doc_mapping: &DocMapping,
     ) -> MetastoreResult<UpdateIndexRequest> {
+        let doc_mapping_json = serde_utils::to_json_str(doc_mapping)?;
+        let indexing_settings_json = serde_utils::to_json_str(indexing_settings)?;
+        let ingest_settings_json = serde_utils::to_json_str(ingest_settings)?;
         let search_settings_json = serde_utils::to_json_str(search_settings)?;
-        let retention_policy_json = retention_policy_opt
+        let retention_policy_json_opt = retention_policy_opt
             .as_ref()
             .map(serde_utils::to_json_str)
             .transpose()?;
-        let indexing_settings_json = serde_utils::to_json_str(indexing_settings)?;
-        let doc_mapping_json = serde_utils::to_json_str(doc_mapping)?;
 
         let update_request = UpdateIndexRequest {
             index_uid: Some(index_uid.into()),
-            search_settings_json,
-            retention_policy_json,
-            indexing_settings_json,
             doc_mapping_json,
+            indexing_settings_json,
+            ingest_settings_json,
+            search_settings_json,
+            retention_policy_json_opt,
         };
         Ok(update_request)
+    }
+    fn deserialize_doc_mapping(&self) -> MetastoreResult<DocMapping> {
+        serde_utils::from_json_str(&self.doc_mapping_json)
+    }
+
+    fn deserialize_indexing_settings(&self) -> MetastoreResult<IndexingSettings> {
+        serde_utils::from_json_str(&self.indexing_settings_json)
+    }
+
+    fn deserialize_ingest_settings(&self) -> MetastoreResult<IngestSettings> {
+        serde_utils::from_json_str(&self.ingest_settings_json)
     }
 
     fn deserialize_search_settings(&self) -> MetastoreResult<SearchSettings> {
@@ -243,18 +258,10 @@ impl UpdateIndexRequestExt for UpdateIndexRequest {
     }
 
     fn deserialize_retention_policy(&self) -> MetastoreResult<Option<RetentionPolicy>> {
-        self.retention_policy_json
+        self.retention_policy_json_opt
             .as_ref()
-            .map(|policy| serde_utils::from_json_str(policy))
+            .map(|policy_json| serde_utils::from_json_str(policy_json))
             .transpose()
-    }
-
-    fn deserialize_indexing_settings(&self) -> MetastoreResult<IndexingSettings> {
-        serde_utils::from_json_str(&self.indexing_settings_json)
-    }
-
-    fn deserialize_doc_mapping(&self) -> MetastoreResult<DocMapping> {
-        serde_utils::from_json_str(&self.doc_mapping_json)
     }
 }
 
@@ -273,10 +280,10 @@ pub trait IndexMetadataResponseExt {
 impl IndexMetadataResponseExt for IndexMetadataResponse {
     fn try_from_index_metadata(index_metadata: &IndexMetadata) -> MetastoreResult<Self> {
         let index_metadata_serialized_json = serde_utils::to_json_str(index_metadata)?;
-        let request = Self {
+        let response = Self {
             index_metadata_serialized_json,
         };
-        Ok(request)
+        Ok(response)
     }
 
     fn deserialize_index_metadata(&self) -> MetastoreResult<IndexMetadata> {
@@ -414,7 +421,7 @@ impl AddSourceRequestExt for AddSourceRequest {
     ) -> MetastoreResult<AddSourceRequest> {
         let source_config_json = serde_utils::to_json_str(&source_config)?;
         let request = Self {
-            index_uid: index_uid.into().into(),
+            index_uid: Some(index_uid.into()),
             source_config_json,
         };
         Ok(request)
@@ -425,6 +432,36 @@ impl AddSourceRequestExt for AddSourceRequest {
     }
 }
 
+/// Helper trait to build a [`UpdateSourceRequest`] and deserialize its payload.
+pub trait UpdateSourceRequestExt {
+    /// Creates a new [`UpdateSourceRequest`] from a [`SourceConfig`].
+    fn try_from_source_config(
+        index_uid: impl Into<IndexUid>,
+        source_config: &SourceConfig,
+    ) -> MetastoreResult<UpdateSourceRequest>;
+
+    /// Deserializes the `source_config_json` field of a [`UpdateSourceRequest`] into a
+    /// [`SourceConfig`].
+    fn deserialize_source_config(&self) -> MetastoreResult<SourceConfig>;
+}
+
+impl UpdateSourceRequestExt for UpdateSourceRequest {
+    fn try_from_source_config(
+        index_uid: impl Into<IndexUid>,
+        source_config: &SourceConfig,
+    ) -> MetastoreResult<UpdateSourceRequest> {
+        let source_config_json = serde_utils::to_json_str(&source_config)?;
+        let request = Self {
+            index_uid: Some(index_uid.into()),
+            source_config_json,
+        };
+        Ok(request)
+    }
+
+    fn deserialize_source_config(&self) -> MetastoreResult<SourceConfig> {
+        serde_utils::from_json_str(&self.source_config_json)
+    }
+}
 /// Helper trait to build a [`DeleteTask`] and deserialize its payload.
 pub trait StageSplitsRequestExt {
     /// Creates a new [`StageSplitsRequest`] from a [`SplitMetadata`].
@@ -451,7 +488,7 @@ impl StageSplitsRequestExt for StageSplitsRequest {
     ) -> MetastoreResult<StageSplitsRequest> {
         let split_metadata_list_serialized_json = serde_utils::to_json_str(&[split_metadata])?;
         let request = Self {
-            index_uid: index_uid.into().into(),
+            index_uid: Some(index_uid.into()),
             split_metadata_list_serialized_json,
         };
         Ok(request)
@@ -464,7 +501,7 @@ impl StageSplitsRequestExt for StageSplitsRequest {
         let splits_metadata: Vec<SplitMetadata> = splits_metadata.into_iter().collect();
         let split_metadata_list_serialized_json = serde_utils::to_json_str(&splits_metadata)?;
         let request = Self {
-            index_uid: index_uid.into().into(),
+            index_uid: Some(index_uid.into()),
             split_metadata_list_serialized_json,
         };
         Ok(request)
@@ -510,6 +547,7 @@ impl ListSplitsRequestExt for ListSplitsRequest {
 }
 
 /// Helper trait to build a [`ListSplitsResponse`] and deserialize its payload.
+#[async_trait]
 pub trait ListSplitsResponseExt {
     /// Creates a new [`ListSplitsResponse`] from a list of [`Split`].
     fn try_from_splits(
@@ -518,27 +556,15 @@ pub trait ListSplitsResponseExt {
 
     /// Deserializes the `splits_serialized_json` field of a [`ListSplitsResponse`] into a list of
     /// [`Split`].
-    fn deserialize_splits(&self) -> MetastoreResult<Vec<Split>>;
+    async fn deserialize_splits(self) -> MetastoreResult<Vec<Split>>;
 
     /// Deserializes the `splits_serialized_json` field of a [`ListSplitsResponse`] into a list of
     /// [`SplitMetadata`].
-    fn deserialize_splits_metadata(&self) -> MetastoreResult<Vec<SplitMetadata>> {
-        let splits = self.deserialize_splits()?;
-        Ok(splits
-            .into_iter()
-            .map(|split| split.split_metadata)
-            .collect())
-    }
+    async fn deserialize_splits_metadata(self) -> MetastoreResult<Vec<SplitMetadata>>;
 
     /// Deserializes the `splits_serialized_json` field of a [`ListSplitsResponse`] into a list of
     /// [`SplitId`].
-    fn deserialize_split_ids(&self) -> MetastoreResult<Vec<SplitId>> {
-        let splits = self.deserialize_splits()?;
-        Ok(splits
-            .into_iter()
-            .map(|split| split.split_metadata.split_id)
-            .collect())
-    }
+    async fn deserialize_split_ids(self) -> MetastoreResult<Vec<SplitId>>;
 
     /// Creates an empty [`ListSplitsResponse`].
     fn empty() -> Self;
@@ -560,6 +586,7 @@ impl PublishSplitsRequestExt for PublishSplitsRequest {
     }
 }
 
+#[async_trait]
 impl ListSplitsResponseExt for ListSplitsResponse {
     fn empty() -> Self {
         Self {
@@ -569,22 +596,46 @@ impl ListSplitsResponseExt for ListSplitsResponse {
 
     fn try_from_splits(splits: impl IntoIterator<Item = Split>) -> MetastoreResult<Self> {
         let splits_serialized_json = serde_utils::to_json_str(&splits.into_iter().collect_vec())?;
-        let request = Self {
+        let response = Self {
             splits_serialized_json,
         };
-        Ok(request)
+        Ok(response)
     }
 
-    fn deserialize_splits(&self) -> MetastoreResult<Vec<Split>> {
-        serde_utils::from_json_str(&self.splits_serialized_json)
+    async fn deserialize_splits(self) -> MetastoreResult<Vec<Split>> {
+        run_cpu_intensive(move || serde_utils::from_json_str(&self.splits_serialized_json))
+            .await
+            .map_err(|join_error| MetastoreError::Internal {
+                message: "failed to deserialize splits".to_string(),
+                cause: join_error.to_string(),
+            })?
+    }
+
+    async fn deserialize_splits_metadata(self) -> MetastoreResult<Vec<SplitMetadata>> {
+        let splits = self.deserialize_splits().await?;
+        let splits_metadata = splits
+            .into_iter()
+            .map(|split| split.split_metadata)
+            .collect();
+        Ok(splits_metadata)
+    }
+
+    async fn deserialize_split_ids(self) -> MetastoreResult<Vec<SplitId>> {
+        let splits = self.deserialize_splits().await?;
+        let split_ids = splits
+            .into_iter()
+            .map(|split| split.split_metadata.split_id)
+            .collect();
+        Ok(split_ids)
     }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 /// A query builder for listing splits within the metastore.
 pub struct ListSplitsQuery {
-    /// A non-empty list of index UIDs for which to fetch the splits.
-    pub index_uids: Vec<IndexUid>,
+    /// A non-empty list of index UIDs for which to fetch the splits, or
+    /// None if we want splits from all indexes.
+    pub index_uids: Option<Vec<IndexUid>>,
 
     /// A specific node ID to filter by.
     pub node_id: Option<NodeId>,
@@ -604,6 +655,9 @@ pub struct ListSplitsQuery {
     /// The time range to filter by.
     pub time_range: FilterRange<i64>,
 
+    /// The maximum time range end to filter by.
+    pub max_time_range_end: Option<i64>,
+
     /// The delete opstamp range to filter by.
     pub delete_opstamp: FilterRange<u64>,
 
@@ -618,7 +672,44 @@ pub struct ListSplitsQuery {
 
     /// Sorts the splits by staleness, i.e. by delete opstamp and publish timestamp in ascending
     /// order.
-    pub sort_by_staleness: bool,
+    pub sort_by: SortBy,
+
+    /// Only return splits whose (index_uid, split_id) are lexicographically after this split
+    pub after_split: Option<(IndexUid, SplitId)>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum SortBy {
+    None,
+    Staleness,
+    IndexUid,
+}
+
+impl SortBy {
+    fn compare(&self, left_split: &Split, right_split: &Split) -> Ordering {
+        match self {
+            SortBy::None => Ordering::Equal,
+            SortBy::Staleness => left_split
+                .split_metadata
+                .delete_opstamp
+                .cmp(&right_split.split_metadata.delete_opstamp)
+                .then_with(|| {
+                    left_split
+                        .publish_timestamp
+                        .cmp(&right_split.publish_timestamp)
+                }),
+            SortBy::IndexUid => left_split
+                .split_metadata
+                .index_uid
+                .cmp(&right_split.split_metadata.index_uid)
+                .then_with(|| {
+                    left_split
+                        .split_metadata
+                        .split_id
+                        .cmp(&right_split.split_metadata.split_id)
+                }),
+        }
+    }
 }
 
 #[allow(unused_attributes)]
@@ -626,44 +717,65 @@ impl ListSplitsQuery {
     /// Creates a new [`ListSplitsQuery`] for the designated index.
     pub fn for_index(index_uid: IndexUid) -> Self {
         Self {
-            index_uids: vec![index_uid],
+            index_uids: Some(vec![index_uid]),
             node_id: None,
             limit: None,
             offset: None,
             split_states: Vec::new(),
             tags: None,
             time_range: Default::default(),
+            max_time_range_end: None,
             delete_opstamp: Default::default(),
             update_timestamp: Default::default(),
             create_timestamp: Default::default(),
             mature: Bound::Unbounded,
-            sort_by_staleness: false,
+            sort_by: SortBy::None,
+            after_split: None,
         }
     }
 
     /// Creates a new [`ListSplitsQuery`] from a non-empty list of index UIDs.
-    /// Returns an error if the list is empty.
-    pub fn try_from_index_uids(index_uids: Vec<IndexUid>) -> MetastoreResult<Self> {
+    /// Returns None if the list is empty.
+    pub fn try_from_index_uids(index_uids: Vec<IndexUid>) -> Option<Self> {
         if index_uids.is_empty() {
-            return Err(MetastoreError::Internal {
-                message: "ListSplitQuery should define at least one index uid".to_string(),
-                cause: "".to_string(),
-            });
+            return None;
         }
-        Ok(Self {
-            index_uids,
+        Some(Self {
+            index_uids: Some(index_uids),
             node_id: None,
             limit: None,
             offset: None,
             split_states: Vec::new(),
             tags: None,
             time_range: Default::default(),
+            max_time_range_end: None,
             delete_opstamp: Default::default(),
             update_timestamp: Default::default(),
             create_timestamp: Default::default(),
             mature: Bound::Unbounded,
-            sort_by_staleness: false,
+            sort_by: SortBy::None,
+            after_split: None,
         })
+    }
+
+    /// Creates a new [`ListSplitsQuery`] for all indexes.
+    pub fn for_all_indexes() -> Self {
+        Self {
+            index_uids: None,
+            node_id: None,
+            limit: None,
+            offset: None,
+            split_states: Vec::new(),
+            tags: None,
+            time_range: Default::default(),
+            max_time_range_end: None,
+            delete_opstamp: Default::default(),
+            update_timestamp: Default::default(),
+            create_timestamp: Default::default(),
+            mature: Bound::Unbounded,
+            sort_by: SortBy::None,
+            after_split: None,
+        }
     }
 
     /// Selects splits produced by the specified node.
@@ -727,6 +839,13 @@ impl ListSplitsQuery {
     /// *greater than* the provided value.
     pub fn with_time_range_start_gt(mut self, v: i64) -> Self {
         self.time_range.start = Bound::Excluded(v);
+        self
+    }
+
+    /// Retains only splits with a time range end that is
+    /// *less than or equal to* the provided value.
+    pub fn with_max_time_range_end(mut self, v: i64) -> Self {
+        self.max_time_range_end = Some(v);
         self
     }
 
@@ -829,7 +948,20 @@ impl ListSplitsQuery {
     /// Sorts the splits by staleness, i.e. by delete opstamp and publish timestamp in ascending
     /// order.
     pub fn sort_by_staleness(mut self) -> Self {
-        self.sort_by_staleness = true;
+        self.sort_by = SortBy::Staleness;
+        self
+    }
+
+    /// Sorts the splits by index_uid and split_id.
+    pub fn sort_by_index_uid(mut self) -> Self {
+        self.sort_by = SortBy::IndexUid;
+        self
+    }
+
+    /// Only return splits whose (index_uid, split_id) are lexicographically after this split.
+    /// This is only useful if results are sorted by index_uid and split_id.
+    pub fn after_split(mut self, split_meta: &SplitMetadata) -> Self {
+        self.after_split = Some((split_meta.index_uid.clone(), split_meta.split_id.clone()));
         self
     }
 }
@@ -1014,10 +1146,11 @@ mod tests {
         assert!(!filter.overlaps_with(75..=124));
     }
 
-    #[test]
-    fn test_list_splits_response_empty() {
+    #[tokio::test]
+    async fn test_list_splits_response_empty() {
         let response = ListSplitsResponse::empty();
-        assert_eq!(response.deserialize_splits().unwrap(), Vec::new());
+        let splits = response.deserialize_splits().await.unwrap();
+        assert!(splits.is_empty());
     }
 
     #[tokio::test]

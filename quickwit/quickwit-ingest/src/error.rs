@@ -1,32 +1,27 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::io;
 
 use mrecordlog::error::*;
 use quickwit_actors::AskError;
 use quickwit_common::rate_limited_error;
-use quickwit_common::tower::BufferError;
 pub(crate) use quickwit_proto::error::{grpc_error_to_grpc_status, grpc_status_to_service_error};
+use quickwit_proto::ingest::router::{IngestFailure, IngestFailureReason};
 use quickwit_proto::ingest::{IngestV2Error, RateLimitingCause};
 use quickwit_proto::types::IndexId;
-use quickwit_proto::{tonic, GrpcServiceError, ServiceError, ServiceErrorCode};
+use quickwit_proto::{GrpcServiceError, ServiceError, ServiceErrorCode, tonic};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, thiserror::Error, Serialize, Deserialize)]
@@ -47,6 +42,8 @@ pub enum IngestServiceError {
     RateLimited(RateLimitingCause),
     #[error("ingest service is unavailable ({0})")]
     Unavailable(String),
+    #[error("bad request ({0})")]
+    BadRequest(String),
 }
 
 impl From<AskError<IngestServiceError>> for IngestServiceError {
@@ -61,8 +58,9 @@ impl From<AskError<IngestServiceError>> for IngestServiceError {
     }
 }
 
-impl From<BufferError> for IngestServiceError {
-    fn from(error: BufferError) -> Self {
+impl From<quickwit_common::tower::BufferError> for IngestServiceError {
+    fn from(error: quickwit_common::tower::BufferError) -> Self {
+        use quickwit_common::tower::BufferError;
         match error {
             BufferError::Closed => IngestServiceError::Unavailable(error.to_string()),
             BufferError::Unknown => IngestServiceError::Internal(error.to_string()),
@@ -96,6 +94,47 @@ impl From<IngestV2Error> for IngestServiceError {
     }
 }
 
+impl From<IngestFailure> for IngestServiceError {
+    fn from(ingest_failure: IngestFailure) -> Self {
+        match ingest_failure.reason() {
+            IngestFailureReason::Unspecified => {
+                IngestServiceError::Internal("unknown error".to_string())
+            }
+            IngestFailureReason::IndexNotFound => IngestServiceError::IndexNotFound {
+                index_id: ingest_failure.index_id,
+            },
+            IngestFailureReason::SourceNotFound => IngestServiceError::Internal(format!(
+                "Ingest v2 source not found for index {}",
+                ingest_failure.index_id
+            )),
+            IngestFailureReason::Internal => {
+                IngestServiceError::Internal("internal error".to_string())
+            }
+            IngestFailureReason::NoShardsAvailable => {
+                IngestServiceError::Unavailable("no shards available".to_string())
+            }
+            IngestFailureReason::ShardRateLimited => {
+                IngestServiceError::RateLimited(RateLimitingCause::ShardRateLimiting)
+            }
+            IngestFailureReason::WalFull => {
+                IngestServiceError::RateLimited(RateLimitingCause::WalFull)
+            }
+            IngestFailureReason::Timeout => {
+                IngestServiceError::Internal("request timed out".to_string())
+            }
+            IngestFailureReason::RouterLoadShedding => {
+                IngestServiceError::RateLimited(RateLimitingCause::RouterLoadShedding)
+            }
+            IngestFailureReason::LoadShedding => {
+                IngestServiceError::RateLimited(RateLimitingCause::LoadShedding)
+            }
+            IngestFailureReason::CircuitBreaker => {
+                IngestServiceError::RateLimited(RateLimitingCause::CircuitBreaker)
+            }
+        }
+    }
+}
+
 impl ServiceError for IngestServiceError {
     fn error_code(&self) -> ServiceErrorCode {
         match self {
@@ -119,6 +158,7 @@ impl ServiceError for IngestServiceError {
             }
             Self::RateLimited(_) => ServiceErrorCode::TooManyRequests,
             Self::Unavailable(_) => ServiceErrorCode::Unavailable,
+            Self::BadRequest(_) => ServiceErrorCode::BadRequest,
         }
     }
 }
@@ -162,6 +202,7 @@ impl From<IngestServiceError> for tonic::Status {
             IngestServiceError::IoError { .. } => tonic::Code::Internal,
             IngestServiceError::RateLimited(_) => tonic::Code::ResourceExhausted,
             IngestServiceError::Unavailable(_) => tonic::Code::Unavailable,
+            IngestServiceError::BadRequest(_) => tonic::Code::InvalidArgument,
         };
         let message = error.to_string();
         tonic::Status::new(code, message)
